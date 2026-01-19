@@ -2,51 +2,66 @@
 
 defaults:
   - _self_
-  - model: varnet_small   # 모델 설정  varnet_sweep2 or fivarnet or f_dlka_varnet or f_psf_varnet
-  - data: local_sangwonDesktop         # 데이터 경로 설정
-  - LRscheduler: ExponentialLR        # ⬅️  추가 - https://gaussian37.github.io/dl-pytorch-lr_scheduler/참고
-  - LossFunction: SSIM+L1
-  - training: base          # base or vessl_vramMin or base_sw or base_me
-  - early_stop: none    # 조기종료 기능 : early_stop or none
-  - evaluation: none
-  - optimizer: nadam          # ⬅️ 새로 추가  
-  - aug: mraugment    # ⬅️ 새로 추가 none or mraugment
-  - centerCropPadding: crop_kspace # crop_zero or crop_noise or crop_kspace
-  - maskDuplicate: none       # acc4_acc8 or none
-  - maskAugment: universal             # universal or basic or none 
-  - collator: identity          # 또는 dynamicCompress or identity or identity_debug
-  - compressor: scc  # ⬅️ 새로 추가       # gcc, scc, none
-  - sampler: grouping          # 또는 grouping or identity
 
-# === Data Preprocessing === -  Mask → Crop → Compress → Tensor
-use_crop: false                  # spatial crop 사용 여부
-crop_size: [384, 384]           # crop 할 (H, W) - 무조건 짝수로 지정
-corner_size : 16
+  # ✅ DLP task 선택 (inverse부터)
+  - task: inverse
+
+  # ✅ DLP 모델/데이터/로스는 새 그룹으로 분리
+  # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)
+  - model: dlp_unet_small
+  - data: local_trainpack
+  - LossFunction: dlp_bce_dice
+
+  # 아래는 기존 hydra 뼈대 재사용용 (필요 없으면 점진적으로 제거)
+  - optimizer: adamw
+  - LRscheduler: CosineAnnealingLR
+  - training: base
+  - early_stop: none
+  - evaluation: none
+  - aug: none
+
+  # DLP inverse에서는 기하학 변환(rotate/flip/crop) 기본 OFF 권장.
+  # maskDuplicate/maskAugment/collator/compressor/sampler는 MRI 전용이므로 우선 none/identity로 둠.
+  - maskDuplicate: none
+  - maskAugment: none
+  - collator: identity
+  - compressor: none
+  - sampler: identity
 
 # === 공통 학습 하이퍼파라미터 ===
 GPU_NUM: 0
-batch_size: 1
-val_batch_size: 1     # 검증 배치 크기 (추가)
-num_epochs: ${max_epochs} # 실제 돌아가는 epoch
-max_epochs : 2   # aug용 max epoch (domain train의 block training 때문에 넣음)
-warmup_epochs : 3
+batch_size: 4
+val_batch_size: 4
+num_epochs: 50
+warmup_epochs: 0
+
 lr: 1e-3
 report_interval: 7000
 seed: 430
 num_workers: 0
 
-exp_name : varnet_finalMainTest_fm1
+exp_name: dlp_inverse_thr2mask_baseline
 
-# these three are *required* by utils/data/load_data.py → create_data_loaders
-input_key:  kspace
-target_key: image_label
-max_key:    max
+# ✅ DLP image I/O 공통 옵션 (Dataset/Transform에서 사용)
+image:
+  size: 1280          # TrainPack이 1280으로 만들어졌다면 그대로
+  in_channels: 1      # thr는 1ch grayscale
+  out_channels: 1     # mask도 1ch
+  normalize: "0_1"    # uint8 [0,255] → float [0,1]
+  binarize_target: true   # mask는 최종적으로 binary라면 true (필요시 gray도 가능)
 
 wandb:
   project: final_train_Debugging
   entity: swpants05-seoul-national-university        # W&B 팀/계정
-  use_wandb: true           # false 이면 모든 wandb 로그 함수가 noop
+  use_wandb: true
   max_vis_per_cat: 5        # epoch 마다 카테고리별 이미지 수 (0 → 안 올림)
 
   use_visLogging: true
   use_receptiveField: false
+
+
+# ✅ (선택) 실험 태그/필터: TrainPack manifest 기반 필터링 옵션
+filters:
+  modes: ["binary", "gray"]   # 또는 ["binary"]만 먼저
+  dataset_allow: []          # 비워두면 전체
+  qc_filter: ""              # 예: "qc__ncc_mask1280_ld1280>0.2"

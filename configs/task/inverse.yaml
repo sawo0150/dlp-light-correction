@@ -1,0 +1,21 @@
+# configs/task/inverse.yaml
+# Inverse-1: thr(=thresholded LD) -> mask
+
+name: inverse
+
+inverse:
+  # input policy
+  input_source: "thr_random"     # ["thr_random", "thr_fixed", "ld_1280_aligned"]
+
+  # thr_random일 때: 한 sample(row) 안에서 여러 장 존재(thr_random_count)
+  # - "random_one": 매 iter마다 1장 랜덤 선택
+  # - "expand_all": (sample,thr)로 dataset을 확장 (데이터 수 증가)
+  thr_random_policy: "expand_all"
+
+  # thr_fixed일 때: 특정 T를 고정하거나, 여러 T를 stack 가능
+  thr_fixed_values: []           # 예: [30,40,50] / 비우면 auto-discover(구현 시)
+  thr_stack: false               # true면 다채널 concat
+
+  # target policy
+  target_key: "mask_1280"        # manifest의 mask_1280_path 사용
+  mode_condition: "from_manifest" # or force: "binary"/"gray"

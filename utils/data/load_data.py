@@ -1,224 +1,324 @@
-# utils/data/load_data.py
+from __future__ import annotations
 
-import h5py, re
+import csv
+import json
+import os
 import random
-from utils.data.transforms import DataTransform
-from torch.utils.data import Dataset, DataLoader
-from hydra.utils import instantiate, get_class
-from omegaconf import OmegaConf
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-from torch.utils.data import default_collate
-from torch.utils.data.sampler import BatchSampler
-from utils.data.transform_wrapper import TransformWrapper
-from utils.data.sampler import GroupByCoilBatchSampler
+import torch
+from torch.utils.data import Dataset, DataLoader
 
-class MultiCompose:
-    def __init__(self, transforms):
-        self.transforms = transforms
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
-    def __call__(self, mask, kspace, target, attrs, fname, slice_idx):
-        for tr in self.transforms:
-            mask, kspace, target, attrs, fname, slice_idx = tr(
-                mask, kspace, target, attrs, fname, slice_idx
-            )
-        return mask, kspace, target, attrs, fname, slice_idx
-
-class SliceData(Dataset):
-    def __init__(self, root, transform, input_key, target_key, forward=False):
-        self.transform = transform
-        self.input_key = input_key
-        self.target_key = target_key
-        self.forward = forward
-        self.image_examples = []
-        self.kspace_examples = []
-
-        def _cat(fname: Path):
-            organ = "brain" if "brain" in fname.name.lower() else "knee"
-            acc   = "x4"   if re.search(r"_acc4_|x4|r04", fname.name, re.I) else "x8"
-            return f"{organ}_{acc}"
-        
-        image_files = list(Path(root / "image").iterdir())
-        kspace_files = list(Path(root / "kspace").iterdir())
-        if not forward:
-            for fname in sorted(image_files):
-                num_slices = self._get_metadata(fname)
-                cat = _cat(fname)
-                self.image_examples += [(fname, i, cat) for i in range(num_slices)]
-            for fname in sorted(kspace_files):
-                num_slices = self._get_metadata(fname)
-                cat = _cat(fname)
-                self.kspace_examples += [(fname, i, cat) for i in range(num_slices)]
-        else:
-            for fname in sorted(kspace_files):
-                num_slices = self._get_metadata(fname)
-                self.kspace_examples += [(fname, i) for i in range(num_slices)]
-            self.image_examples = self.kspace_examples
-
-        # coil_map = {}
-        shape_map = {}
-        for entry in self.kspace_examples:
-            fname = entry[0]
-            key = str(fname)
-            # if key not in coil_map:
-            if key not in shape_map:
-                with h5py.File(fname, 'r') as hf:
-                    arr = hf[self.input_key]
-                    # coil_map[key] = arr.shape[1]
-                    # arr.shape == (num_slices, C, H, W)
-                    shape_map[key] = tuple(arr.shape[1:])
-
-        # self.coil_counts = [coil_map[str(entry[0])] for entry in self.kspace_examples]
-        # 기존 coil_counts 유지
-        self.coil_counts = [shape[0] for shape in (shape_map[str(e[0])] for e in self.kspace_examples)]
-        # 새로운 sample_shapes 속성 추가
-        self.sample_shapes = [shape_map[str(entry[0])] for entry in self.kspace_examples]
-
-    def _get_metadata(self, fname):
-        with h5py.File(fname, "r") as hf:
-            if self.input_key in hf:
-                return hf[self.input_key].shape[0]
-            if isinstance(self.target_key, str) and self.target_key in hf:
-                return hf[self.target_key].shape[0]
-            first_ds = next(iter(hf.keys()))
-            return hf[first_ds].shape[0]
-
-    def __len__(self):
-        return len(self.kspace_examples)
-
-    def __getitem__(self, i):
-        if not self.forward:
-            image_fname, _, cat = self.image_examples[i]
-            kspace_fname, dataslice, cat = self.kspace_examples[i]
-        else:
-            image_fname, _ = self.image_examples[i]
-            kspace_fname, dataslice = self.kspace_examples[i]
-
-        if not self.forward and image_fname.name != kspace_fname.name:
-            raise ValueError(f"Image file {image_fname.name} does not match kspace file {kspace_fname.name}")
-
-        with h5py.File(kspace_fname, "r") as hf:
-            input_data = hf[self.input_key][dataslice]
-            mask = np.array(hf["mask"])
-        if self.forward:
-            target = -1
-            attrs = {}
-        else:
-            with h5py.File(image_fname, "r") as hf:
-                target = hf[self.target_key][dataslice]
-                attrs = dict(hf.attrs)
-            attrs['cat'] = cat
-        sample = self.transform(mask, input_data, target, attrs, kspace_fname.name, dataslice)
-        return (*sample, cat) if not self.forward else sample
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 
-def create_data_loaders(data_path, args, shuffle=False, isforward=False, 
-                        augmenter=None, mask_augmenter=None, is_train=False,
-                        domain_filter=None):
-    if isforward == False:
-        max_key_ = args.max_key
-        target_key_ = args.target_key
-    else:
-        max_key_ = -1
-        target_key_ = None
+def _read_gray_u8(path: Path) -> np.ndarray:
+    """
+    Read grayscale PNG to uint8 HxW.
+    Prefers cv2. Fallback PIL.
+    """
+    if cv2 is not None:
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"failed to read image: {path}")
+        return img.astype(np.uint8)
+    if Image is not None:
+        img = Image.open(path).convert("L")
+        return np.array(img, dtype=np.uint8)
+    raise RuntimeError("Need opencv-python or pillow to read png.")
 
-    transforms = []
 
-    if augmenter is not None and not isforward:
-        transforms.append(augmenter)
+def _u8_to_float(img_u8: np.ndarray, normalize: str) -> np.ndarray:
+    if normalize == "0_1":
+        return (img_u8.astype(np.float32) / 255.0)
+    if normalize == "-1_1":
+        return (img_u8.astype(np.float32) / 127.5) - 1.0
+    # none
+    return img_u8.astype(np.float32)
 
-    if mask_augmenter is not None and not isforward:
-        transforms.append(mask_augmenter)
 
-    from utils.data.transforms import MaskApplyTransform
-    transforms.append(MaskApplyTransform())
+def _binarize(img: np.ndarray, thr: float = 0.5) -> np.ndarray:
+    return (img >= thr).astype(np.float32)
 
-    # ✨ [수정] `use_noise_padding` 하이퍼파라미터를 읽어 transform에 전달
-    if getattr(args, 'use_crop', False):
-        # transforms.append(CenterCropOrPad(target_size=tuple(args.crop_size)))
-        transforms.append(instantiate(args.centerCropPadding))
 
-    # # (3) Coil compression (토글)
-    # if getattr(args, "compressor", None):
-    #     comp_tr = instantiate(args.compressor)
-    #     transforms.append(comp_tr)
+def _load_split_ids_from_txt(splits_dir: Path, split: str) -> set:
+    p = splits_dir / f"{split}.txt"
+    if not p.exists():
+        raise FileNotFoundError(f"split file not found: {p}")
+    ids = set()
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                ids.add(s)
+    return ids
 
-    # (4) Tensor 변환 및 real/imag 스택
-    transforms.append(DataTransform(isforward, max_key_))
 
-    transform_chain = MultiCompose(transforms)
+@dataclass
+class TrainPackRow:
+    sample_key: str
+    dataset: str
+    mode: str
+    mask_1280_path: str
+    ld_1280_aligned_path: str
+    thr_random_dir: str
+    thr_random_count: int
+    thr_fixed_map_json: str
+    split: str
 
-    raw_ds = SliceData(
-        root=data_path, transform=lambda *x: x,
-        input_key=args.input_key, target_key=target_key_, forward=isforward
+
+class TrainPackManifestDataset(Dataset):
+    """
+    DLP TrainPack dataset (inverse by default):
+      input:  thr image (random or fixed or ld_1280_aligned)
+      target: mask_1280 (binary or grayscale)
+
+    Returns:
+      x: FloatTensor [C,H,W]
+      y: FloatTensor [C,H,W]
+      meta: dict (strings/ints) for logging/debug
+    """
+    def __init__(
+        self,
+        trainpack_root: Path,
+        manifest_csv: Path,
+        splits_dir: Path,
+        split_source: str,
+        split: str,
+        modes: List[str],
+        task_cfg: Dict,
+        image_cfg: Dict,
+        filters_cfg: Optional[Dict] = None,
+        seed: int = 1234,
+        shuffle_thr: bool = True,
+    ):
+        self.root = Path(trainpack_root)
+        self.manifest_csv = Path(manifest_csv)
+        self.splits_dir = Path(splits_dir)
+        self.split_source = split_source
+        self.split = split
+        self.modes = set(modes)
+        self.task_cfg = task_cfg
+        self.image_cfg = image_cfg
+        self.filters_cfg = filters_cfg or {}
+        self.seed = int(seed)
+        self.shuffle_thr = bool(shuffle_thr)
+
+        # inverse settings
+        inv = (task_cfg or {}).get("inverse", {})
+        self.input_source = inv.get("input_source", "thr_random")  # thr_random|thr_fixed|ld_1280_aligned
+        self.thr_random_policy = inv.get("thr_random_policy", "expand_all")  # expand_all|random_one
+        self.thr_fixed_values = inv.get("thr_fixed_values", [])
+        self.thr_stack = bool(inv.get("thr_stack", False))
+        self.target_key = inv.get("target_key", "mask_1280")
+
+        # image settings
+        self.normalize = image_cfg.get("normalize", "0_1")
+        self.binarize_target = bool(image_cfg.get("binarize_target", True))
+
+        # load manifest
+        rows = self._read_manifest_rows()
+
+        # split filter
+        rows = self._apply_split(rows)
+
+        # mode filter
+        rows = [r for r in rows if r.mode in self.modes]
+
+        # optional dataset allowlist
+        allow = self.filters_cfg.get("dataset_allow", [])
+        if allow:
+            allow = set(allow)
+            rows = [r for r in rows if r.dataset in allow]
+
+        # build index (may expand by thr_random images)
+        self.items: List[Dict] = self._build_items(rows)
+        if len(self.items) == 0:
+            raise RuntimeError("No samples after filtering. Check split/modes/filters.")
+
+        # per-epoch rng base
+        self._rng = random.Random(self.seed)
+
+    def _read_manifest_rows(self) -> List[TrainPackRow]:
+        out: List[TrainPackRow] = []
+        with open(self.manifest_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                out.append(
+                    TrainPackRow(
+                        sample_key=row["sample_key"],
+                        dataset=row.get("dataset", ""),
+                        mode=row.get("mode", ""),
+                        mask_1280_path=row.get("mask_1280_path", ""),
+                        ld_1280_aligned_path=row.get("ld_1280_aligned_path", ""),
+                        thr_random_dir=row.get("thr_random_dir", ""),
+                        thr_random_count=int(row.get("thr_random_count", "0") or "0"),
+                        thr_fixed_map_json=row.get("thr_fixed_map_json", "{}"),
+                        split=row.get("split", ""),
+                    )
+                )
+        return out
+
+    def _apply_split(self, rows: List[TrainPackRow]) -> List[TrainPackRow]:
+        if self.split_source == "txt":
+            ids = _load_split_ids_from_txt(self.splits_dir, self.split)
+            return [r for r in rows if r.sample_key in ids]
+        # default: manifest split column
+        return [r for r in rows if r.split == self.split]
+
+    def _list_thr_random_files(self, thr_dir_rel: str, sample_key: str) -> List[Path]:
+        if not thr_dir_rel:
+           return []
+        d = self.root / thr_dir_rel
+        if not d.exists():
+            return []
+        # naming: {sample_key}__Rxx__thr.png (extract script)
+        files = sorted(d.glob(f"{sample_key}__R*.png"))
+        return files
+
+    def _pick_thr_fixed_file(self, thr_fixed_map_json: str, sample_key: str) -> Optional[Path]:
+        try:
+            m = json.loads(thr_fixed_map_json or "{}")
+        except Exception:
+            m = {}
+        if not m:
+            return None
+        # if user specifies values, try them in order
+        if self.thr_fixed_values:
+            for t in self.thr_fixed_values:
+                key = str(int(t))
+                if key in m and m[key]:
+                    return self.root / m[key]
+        # otherwise pick any one (stable order)
+        k = sorted(m.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999)[0]
+        return self.root / m[k]
+
+    def _build_items(self, rows: List[TrainPackRow]) -> List[Dict]:
+        items: List[Dict] = []
+        for r in rows:
+            target = self.root / r.mask_1280_path
+            if not target.exists():
+                continue
+
+            if self.input_source == "ld_1280_aligned":
+                x = self.root / r.ld_1280_aligned_path
+                if x.exists():
+                    items.append({"row": r, "x_path": x, "y_path": target, "thr_id": ""})
+                continue
+
+            if self.input_source == "thr_fixed":
+                x = self._pick_thr_fixed_file(r.thr_fixed_map_json, r.sample_key)
+                if x is not None and x.exists():
+                    items.append({"row": r, "x_path": x, "y_path": target, "thr_id": "fixed"})
+                continue
+
+            # default: thr_random
+            thr_files = self._list_thr_random_files(r.thr_random_dir, r.sample_key)
+            if not thr_files:
+                continue
+            if self.thr_random_policy == "random_one":
+                # store the list; choose at __getitem__
+                items.append({"row": r, "x_paths": thr_files, "y_path": target})
+            else:
+                # expand_all
+                for p in thr_files:
+                    items.append({"row": r, "x_path": p, "y_path": target, "thr_id": p.stem})
+        return items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _get_x_path(self, item: Dict) -> Path:
+        if "x_path" in item:
+            return item["x_path"]
+        # random_one
+        paths: List[Path] = item["x_paths"]
+        if self.shuffle_thr:
+            # sample per call (deterministic-ish with seed + index)
+            return paths[self._rng.randrange(0, len(paths))]
+        return paths[0]
+
+    def __getitem__(self, idx: int):
+        item = self.items[idx]
+        r: TrainPackRow = item["row"]
+        x_path = self._get_x_path(item)
+        y_path = item["y_path"]
+
+        x_u8 = _read_gray_u8(x_path)
+        y_u8 = _read_gray_u8(y_path)
+
+        x = _u8_to_float(x_u8, self.normalize)
+        y = _u8_to_float(y_u8, self.normalize)
+        if self.binarize_target:
+            y = _binarize(y, 0.5)
+        # to CHW
+        x = torch.from_numpy(x).unsqueeze(0)  # [1,H,W]
+        y = torch.from_numpy(y).unsqueeze(0)  # [1,H,W]
+
+        meta = {
+            "sample_key": r.sample_key,
+            "dataset": r.dataset,
+            "mode": r.mode,
+            "x_path": str(x_path),
+            "y_path": str(y_path),
+            "input_source": self.input_source,
+        }
+        return x, y, meta
+
+
+def create_data_loaders(
+    args,
+    split: str,
+    shuffle: bool,
+    is_train: bool,
+):
+    """
+    DLP TrainPack dataloader factory.
+    - split: "train"/"val"/"test"
+    """
+    task_cfg = getattr(args, "task", {})
+    data_cfg = getattr(args, "data", {})
+    image_cfg = getattr(args, "image", {})
+    filters_cfg = getattr(args, "filters", {})
+
+    trainpack_root = Path(getattr(args, "data_trainpack_root"))
+    manifest_csv = Path(getattr(args, "data_manifest_csv"))
+    splits_dir = Path(getattr(args, "data_splits_dir"))
+    split_source = getattr(args, "data_split_source", "manifest")
+    modes = list(getattr(args, "data_modes", ["binary", "gray"]))
+    ds = TrainPackManifestDataset(
+        trainpack_root=trainpack_root,
+        manifest_csv=manifest_csv,
+        splits_dir=splits_dir,
+        split_source=split_source,
+        split=split,
+        modes=modes,
+        task_cfg=task_cfg,
+        image_cfg=image_cfg,
+        filters_cfg=filters_cfg,
+       seed=int(getattr(args, "seed", 1234)),
+        shuffle_thr=bool(is_train),
     )
-    
-    # ───── 도메인(cat) 필터링 ───────────────────────────────────────────
-    if domain_filter:
-        from utils.data.domain_subset import DomainSubset
-        raw_ds = DomainSubset(raw_ds, domain_filter)
 
-    # 2)  *** Duplicate 적용 (crop 前) ***
-    dup_cfg = getattr(args,"maskDuplicate",{"enable":False})
-    if dup_cfg.get("enable",False) and not isforward and is_train: 
-        dup_cfg_clean = OmegaConf.create({k:v for k,v in dup_cfg.items()
-                                          if k!="enable"})
-        duped_ds = instantiate(dup_cfg_clean, base_ds=raw_ds,
-                               _recursive_=False)
-    else:
-        duped_ds = raw_ds
+    batch_size = int(getattr(args, "batch_size", 4)) if is_train else int(getattr(args, "val_batch_size", 4))
+    num_workers = int(getattr(args, "num_workers", 0))
 
-    data_storage = TransformWrapper(duped_ds, transform_chain)
-    
-    collate_fn = default_collate if isforward else instantiate(args.collator, _recursive_=False)
-
-    # # Crop OFF시 batch_size 강제 1
-    # use_crop = getattr(args, 'use_crop', False)
-    batch_size = args.batch_size
-    if not is_train:
-        batch_size = args.val_batch_size
-    # if not use_crop:
-    #     if batch_size != 1:
-    #         print("[WARN] use_crop=False 이므로 batch_size=1로 강제합니다.")
-    #     batch_size = 1
-
-    # 2) sampler 인스턴스 하나만 만들기
-    if isforward:
-        sampler = GroupByCoilBatchSampler(
-            data_source=data_storage,
-            sample_shapes=getattr(data_storage, "sample_shapes", None),
-            batch_size=batch_size,
-            shuffle=False,
-        )
-    else:
-        sampler = instantiate(
-            args.sampler, data_source=data_storage,
-            sample_shapes=getattr(data_storage, "sample_shapes", None),
-            batch_size=batch_size,
-            shuffle=shuffle,
-            _recursive_=False
-        )
-
-    num_workers = args.num_workers
-    # if not use_crop and isforward:
-    #     if num_workers != 0:
-    #         print("[WARN] use_crop=False + isforward=True => num_workers=0으로 강제!")
-    #     num_workers = 0
-
-    # 3) DataLoader 에 넘겨줄 인자 결정
-    #    sampler 가 BatchSampler 계열이면 batch_sampler=, 아니면 sampler= 로
-    if isinstance(sampler, BatchSampler):
-        return DataLoader(
-            dataset=data_storage,
-            batch_sampler=sampler,
-            num_workers=num_workers,
-            collate_fn=collate_fn
-        )
-    else:
-        return DataLoader(
-            dataset=data_storage,
-            sampler=sampler,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            collate_fn=collate_fn
-        )
+    return DataLoader(
+        dataset=ds,
+        batch_size=batch_size,
+        shuffle=bool(shuffle),
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=bool(is_train),
+    )

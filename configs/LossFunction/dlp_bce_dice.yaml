@@ -1,0 +1,7 @@
+# configs/LossFunction/dlp_bce_dice.yaml
+
+_target_: utils.common.loss_function.BCEDiceLoss   # TODO: 구현 후 교체
+
+bce_weight: 1.0
+dice_weight: 1.0
+smooth: 1.0

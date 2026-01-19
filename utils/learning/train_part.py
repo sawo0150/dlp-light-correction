@@ -1,13 +1,12 @@
+# utils/learning/train_part.py
+
 import shutil
 import numpy as np
 import torch
 import torch.nn as nn
 import time, math
 from pathlib import Path
-import copy
-from typing import Optional
-from importlib import import_module
-import inspect, math
+from typing import Dict, Optional
 
 try:
     import wandb
@@ -27,27 +26,32 @@ os.environ.setdefault(
 import shutil
 
 from tqdm import tqdm
-from hydra.utils import instantiate          # ★ NEW
-from omegaconf import OmegaConf              # ★ NEW
-from torchvision.utils import make_grid
-from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure  # ★ NEW
-from torch.cuda.amp import GradScaler, autocast          # ★---
-from torch.nn import Module
-from torch.nn.utils import clip_grad_norm_   # ★ NEW
+from hydra.utils import instantiate        
+from omegaconf import OmegaConf     
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn.utils import clip_grad_norm_  
 
-from collections import defaultdict
 from utils.data.load_data import create_data_loaders
-from utils.learning.leaderboard_eval_part import run_leaderboard_eval
 from utils.logging.metric_accumulator import MetricAccumulator
 from utils.logging.vis_logger import log_epoch_samples
-from utils.common.utils import save_reconstructions, ssim_loss, ssim_loss_gpu
-from utils.common.loss_function import SSIMLoss # train loss & metric loss
-from utils.logging.receptive_field import log_receptive_field
 
+# (선택) metric logger는 간단히 숫자만 찍도록 축소
 
-
+def _dice_iou_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
+    """
+    logits: [B,1,H,W] (unbounded) or probs
+    target: [B,1,H,W] in {0,1}
+    """
+    probs = torch.sigmoid(logits)
+    pred = (probs >= 0.5).float()
+    inter = (pred * target).sum(dim=(1,2,3))
+    union = (pred + target - pred*target).sum(dim=(1,2,3))
+    dice = (2*inter + eps) / (pred.sum(dim=(1,2,3)) + target.sum(dim=(1,2,3)) + eps)
+    iou = (inter + eps) / (union + eps)
+    return dice.mean().item(), iou.mean().item()
+ 
 def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
-                loss_type, ssim_metric, metricLog_train,
+                loss_fn,
                 scaler, amp_enabled, use_deepspeed, accum_steps):
     # print(sum(p.numel() for p in model.parameters()))
     # from utils.model.feature_varnet.modules import DLKAConvBlock
@@ -63,7 +67,6 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
     # start_epoch = start_iter = time.perf_counter()
     len_loader = len(data_loader)
     total_loss = 0.
-    total_slices = 0
 
     grad_clip_enabled  = getattr(args, "training_grad_clip_enable", False)
     grad_clip_max_norm = getattr(args, "training_grad_clip_max_norm", 1.0)
@@ -77,14 +80,13 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
 
     start_iter = time.perf_counter()
     for iter, data in pbar:
-        mask, kspace, target, maximum, fnames, _, cats = data
-        mask = mask.cuda(non_blocking=True)
-        kspace = kspace.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
-        maximum = maximum.cuda(non_blocking=True)
+        # DLP: (x, y, meta)
+        x, y, meta = data
+        x = x.cuda(non_blocking=True)
+        y = y.cuda(non_blocking=True)        
 
         with autocast(enabled=amp_enabled):
-            output = model(kspace, mask)
+            logits = model(x)
 
         # ✅ [VRAM 로깅 추가] report_interval 마다 VRAM 사용량 출력
         if iter > 0 and iter % args.report_interval == 0:
@@ -93,8 +95,8 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
             vram_peak = torch.cuda.max_memory_allocated() / 1024**2
             print(f"\n  [VRAM at iter {iter}] Allocated: {vram_alloc:.2f} MB | Peak: {vram_peak:.2f} MB")
             
-        current_loss = loss_type(output, target, maximum, cats)
-        loss = current_loss.mean() / accum_steps
+        # loss_fn은 (logits, target) 형태를 가정
+        loss = loss_fn(logits, y) / accum_steps
 
         # print("max alloc MB:", torch.cuda.max_memory_allocated() / 1024**2)
         # print("max memory_reserved MB:", torch.cuda.torch.cuda.max_memory_reserved() / 1024**2)
@@ -150,45 +152,25 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
                 if isinstance(scheduler, (torch.optim.lr_scheduler.OneCycleLR,
                                           torch.optim.lr_scheduler.CyclicLR)):
                     scheduler.step()
-        
-        # -------- SSIM Metric (no grad) ----------------------------------
-        loss_vals = current_loss.detach().cpu().tolist()                # list of floats, len=
-        with torch.no_grad():
-            ssim_loss_vals = ssim_metric(output.detach(), target, maximum, cats)
-            ssim_vals = [1.0 - v for v in ssim_loss_vals]
 
-        total_loss += sum(loss_vals)
-        total_slices += len(loss_vals)
+        total_loss += float(loss.detach().item()) * accum_steps
+        dice, iou = _dice_iou_from_logits(logits.detach(), y.detach())
+        pbar.set_postfix(loss=f"{(total_loss/(iter+1)):.4g}", dice=f"{dice:.3f}", iou=f"{iou:.3f}")
 
-        # --- tqdm & ETA ---------------------------------------------------
-        batch_mean = sum(loss_vals) / len(loss_vals)
-        pbar.set_postfix(loss=f"{batch_mean:.4g}")
-
-        # --- 카테고리별 & slice 별 누적 -------------------------------------
-        # MetricAccumulator.update(loss: float, ssim: float, cats: list[str])
-        # 여기서는 샘플별로 호출해서, 각 slice 로깅
-        for lv, sv, cat in zip(loss_vals, ssim_vals, cats):
-            metricLog_train.update(lv, sv, [cat])
-
-        # ---------- ❸ loop 끝 직후 불필요 텐서 ‧ list 즉시 해제 --------------------
-        del output, current_loss, loss, loss_vals, ssim_loss_vals
+        del logits, loss
         torch.cuda.empty_cache()
-
-    # total_loss = total_loss / len_loader
-    # return total_loss, time.perf_counter() - start_epoch
-
+        
     epoch_time = time.perf_counter() - start_iter
-    return total_loss / total_slices, epoch_time
+    return total_loss / max(1, len_loader), epoch_time
 
 
-def validate(args, model, data_loader, acc_val, epoch, loss_type, ssim_metric):
+def validate(args, model, data_loader, epoch, loss_fn):
     model.eval()
-    reconstructions = defaultdict(dict)
-    targets = defaultdict(dict)
     start = time.perf_counter()
     total_loss = 0.0
-    total_ssim = 0.0
-    n_slices   = 0
+    total_dice = 0.0
+    total_iou  = 0.0
+    n_batches  = 0
     
     len_loader = len(data_loader)                 # ← 전체 길이
     pbar = tqdm(enumerate(data_loader),           # ← tqdm 래퍼
@@ -199,53 +181,27 @@ def validate(args, model, data_loader, acc_val, epoch, loss_type, ssim_metric):
     
     with torch.no_grad():
         for idx, data in pbar:
-            mask, kspace, target, maximum, fnames, slices, cats = data
-            kspace = kspace.cuda(non_blocking=True)
-            mask = mask.cuda(non_blocking=True)
-            target  = target.cuda(non_blocking=True)
-            maximum = maximum.cuda(non_blocking=True)
-            output = model(kspace, mask)
-            # print("max alloc MB:", torch.cuda.max_memory_allocated() / 1024**2)
-            
-            for i in range(output.shape[0]):    # validate Batch 개수 고려해서 for로 묶었는듯
-                reconstructions[fnames[i]][int(slices[i])] = output[i].cpu().numpy()
-                targets[fnames[i]][int(slices[i])]       = target[i].cpu().numpy()
+            x, y, meta = data
+            x = x.cuda(non_blocking=True)
+            y = y.cuda(non_blocking=True)
 
-                # ------------------ loss 계산 -------------------
-                out_slice = output[i]
-                tgt_slice = target[i]
-                max_i     = maximum[i] if maximum.ndim>0 else maximum
-                loss_i    = loss_type(out_slice, tgt_slice, max_i, cats[i]).item()
-                total_loss += loss_i
-                n_slices  += 1
+            logits = model(x)
+            loss = loss_fn(logits, y)
+            dice, iou = _dice_iou_from_logits(logits, y)
 
-                # -------------- SSIM metric 계산 ---------------
-                ssim_loss_i = ssim_metric(out_slice, tgt_slice, max_i, cats[i]).item()
-                ssim_i = 1 - ssim_loss_i
-                total_ssim += ssim_i
-                acc_val.update(loss_i, ssim_i, [cats[i]])
+            total_loss += float(loss.item())
+            total_dice += float(dice)
+            total_iou  += float(iou)
+            n_batches += 1
+            pbar.set_postfix(loss=f"{(total_loss/n_batches):.4g}", dice=f"{(total_dice/n_batches):.3f}", iou=f"{(total_iou/n_batches):.3f}")
 
-        # free per-slice tensors to reduce cached memory
-        del out_slice, tgt_slice, loss_i, ssim_loss_i
         torch.cuda.empty_cache()
 
-    for fname in reconstructions:
-        reconstructions[fname] = np.stack(
-            [out for _, out in sorted(reconstructions[fname].items())]
-        )
-    for fname in targets:
-        targets[fname] = np.stack(
-            [out for _, out in sorted(targets[fname].items())]
-        )
-    # 기존 validate 방식 : subject 별 평균값의 평균값 (leaderboard랑 평가 방식이 다름)
-    # metric_loss = sum([ssim_loss(targets[fname], reconstructions[fname]) for fname in reconstructions])
-    # num_subjects = len(reconstructions)
-    
-    metric_loss = total_loss / n_slices        # ← leaderboard 방식 (Slice 별 평균)
-    metric_ssim = total_ssim / n_slices        # ← leaderboard 방식 (Slice 별 평균)
-    
-
-    return metric_loss, metric_ssim, n_slices, reconstructions, targets, None, time.perf_counter() - start
+    metric_loss = total_loss / max(1, n_batches)
+    metric_dice = total_dice / max(1, n_batches)
+    metric_iou  = total_iou  / max(1, n_batches)
+    return metric_loss, metric_dice, metric_iou, time.perf_counter() - start
+ 
 
 def save_model(args, exp_dir, epoch, model, optimizer, best_val_loss, is_new_best):
     
@@ -266,16 +222,8 @@ def train(args):
     torch.cuda.set_device(device)
     
     print('Current cuda device: ', torch.cuda.current_device())
-
-    # 파일 맨 앞, train() 안
-    dup_cfg   = getattr(args, "maskDuplicate", {"enable": False})
-    dup_mul   = (len(dup_cfg.get("accel_cfgs", []))
-                if dup_cfg.get("enable", False) else 1)
-    
-    print("[Hydra-visLogging] ", getattr(args, "wandb_use_visLogging", False))
-    print("[Hydra-receptiveField] ", getattr(args, "wandb_use_receptiveField", False))
-    
-    print(f"[Hydra-maskDuplicate] {dup_cfg}")
+    # DLP에서는 maskDuplicate/maskAugment/collator/compressor/sampler 등 MRI 전용 기능 제거
+    dup_mul = 1
 
     # ▸ 0. 옵션 파싱 (기본값 유지)
     # ───────── Gradient Accumulation 기본값 및 스케줄러 설정 ─────────
@@ -322,63 +270,23 @@ def train(args):
     print(f"[Hydra-eval] early_enabled={early_enabled}, stage_table={stage_table}")
 
 
-    # model = VarNet(num_cascades=args.cascade,
-    #                chans=args.chans,
-    #                sens_chans=args.sens_chans,
-    #                use_checkpoint=checkpointing).to(device)    # ← Hydra 플래그 연결)
     # instantiate(cfg.model) 로 모든 모델 파라미터 주입,
     # use_checkpoint 은 training.checkpointing 에 따름
-    model_cfg = getattr(args, "model", {"_target_": "utils.model.varnet.VarNet"})
-    model = instantiate(OmegaConf.create(model_cfg), use_checkpoint=checkpointing)
+    model_cfg = getattr(args, "model")
+    model = instantiate(OmegaConf.create(model_cfg))
     model.to(device)
     print(f"[Hydra-model] model_cfg={model_cfg}")
 
-    loss_cfg = getattr(args, "LossFunction", {"_target_": "utils.common.loss_function.SSIMLoss"})
-    loss_type = instantiate(OmegaConf.create(loss_cfg)).to(device=device)
-    # SSIM metric 계산용 (항상 SSIM 기반 로그를 위해 별도 생성)
-    mask_th = {  'brain_x4': 5e-5,
-                    'brain_x8': 5e-5,
-                    'knee_x4':  2e-5,
-                    'knee_x8':  2e-5}
-    ssim_metric = SSIMLoss(mask_only = True, mask_threshold=mask_th).to(device=device)
-
-    print(f"[Hydra] loss_func ▶ {loss_type}")      # 디버그
-
+    loss_cfg = getattr(args, "LossFunction")
+    loss_fn = instantiate(OmegaConf.create(loss_cfg)).to(device=device)
+    print(f"[Hydra] loss_func ▶ {loss_fn}")
 
     # ── 1. Optimizer 선택 (fallback: Adam) ─────────────────────────────
     # DeepSpeed 활성화 여부를 미리 확인
     ds_cfg = getattr(args, "deepspeed", None)
     use_deepspeed = ds_cfg is not None and ds_cfg.get("enable", False)
 
-    # DeepSpeed가 활성화된 경우, DeepSpeed의 옵티마이저를 강제 사용
-    if use_deepspeed:
-        print("[DeepSpeed] DeepSpeed 활성화! 기존 Optimizer 설정과 무관하게 DeepSpeed용 Optimizer로 변환합니다.")
-        optimizer = None # DeepSpeed가 자체적으로 옵티마이저를 생성하도록 None으로 설정
-        # ds_cfg["config"]["optimizer"] 블록을 직접 사용할 것이므로 여기서는 instantiate하지 않음
-    else:
-        # DeepSpeed가 비활성화된 경우, 기존 Hydrya 옵티마이저 설정 사용
-        optim_cfg = getattr(args, "optimizer", None)
-        if optim_cfg is not None:
-            optimizer = instantiate(
-                OmegaConf.create(optim_cfg),
-                params=model.parameters()
-            )
-        else:
-            optimizer = torch.optim.Adam(model.parameters(), args.lr)
-        print(f"[Hydra] Optimizer ▶ {optimizer.__class__.__name__}")
-
-    # ─ train() 맨 앞쪽: train_loader 길이 한 번만 미리 계산 ─
-    temp_loader = create_data_loaders(
-        data_path=args.data_path_train,
-        args=args,
-        shuffle=True,
-        augmenter=None,            # 길이만 알면 되므로 Augment 미적용
-        mask_augmenter=None,
-        is_train=True,
-        domain_filter=getattr(args, "domain_filter", None)
-    )
-    effective_steps = math.ceil(len(temp_loader) / accum_steps)
-    del temp_loader                # 메모리 바로 반환
+    temp_loader = create_data_loaders(args=args, split="train", shuffle=True, is_train=True)
 
     # ❷ DeepSpeed 스케줄러 파라미터 동적 채우기
     ds_cfg = getattr(args, "deepspeed", None)
@@ -461,25 +369,9 @@ def train(args):
         print(f"[DeepSpeed] 최종 Optimizer: {optimizer.__class__.__name__}")
         print(f"[DeepSpeed] 최종 LR Scheduler: {scheduler.__class__.__name__ if scheduler else 'None'}")
 
-
-    # ✨ Augmenter 객체 생성
+    # DLP inverse MVP에서는 augmenter/MaskAugmenter 기능은 일단 제거 (필요하면 나중에 DLP용으로 다시 추가)
     augmenter = None
-    if getattr(args, "aug", None):
-        print("[Hydra] Augmenter를 생성합니다.")
-        # args.aug에 mraugment.yaml에서 읽은 설정이 들어있습니다.
-        augmenter = instantiate(args.aug)
-    print(getattr(args, "aug", None))
-
-    # ① MaskAugmenter : 한 번만 생성
     mask_augmenter = None
-    mask_aug_cfg = getattr(args, "maskAugment", {"enable": False})
-    print("[Hydra] mask_augmenter : ", mask_aug_cfg.get("enable", False))
-    if mask_aug_cfg.get("enable", False):
-        # 'enable' 키만 제거한 새 OmegaConf 객체를 만들어야 합니다.
-        cfg_clean = OmegaConf.create({k: v for k, v in mask_aug_cfg.items()
-                                    if k != "enable"})
-        mask_augmenter = instantiate(cfg_clean)
-    print(getattr(args, "maskAugment", None))
 
     # ── Resume logic (이제 model, optimizer가 정의된 이후) ──
     start_epoch   = 0
@@ -518,9 +410,8 @@ def train(args):
         scaler.load_state_dict(ckpt['scaler'])
         print(f"[Resume] Loaded GradScaler state")
 
-
-    print(args.data_path_train)
-    print(args.data_path_val)
+    print("[Data] trainpack_root:", getattr(args, "data_trainpack_root", None))
+    print("[Data] manifest_csv  :", getattr(args, "data_manifest_csv", None))
 
     # ───────────────── evaluation 서브트리 언랩 ─────────────────
     # ①  args.evaluation 이 이미 {"enable": …} 형태라면 그대로 사용
@@ -536,13 +427,7 @@ def train(args):
     print(f"[Hydra-eval] lb_enable={lb_enable}, lb_every={lb_every}")
 
     # train_loader = create_data_loaders(data_path = args.data_path_train, args = args, shuffle=True) # 매 에폭마다 생성 예정
-    val_loader = create_data_loaders(data_path=args.data_path_val, 
-                                     args=args, 
-                                     augmenter=None,
-                                     mask_augmenter=None,
-                                     is_train=False,     # ★ val/test는 False)
-                                     domain_filter=getattr(args, "domain_filter", None),
-    )
+    val_loader = create_data_loaders(args=args, split="val", shuffle=False, is_train=False)
     
     # ▲ Resume 시 기존 val_loss_log를 불러와 이어서 기록
     val_loss_log_file = os.path.join(args.val_loss_dir, "val_loss_log.npy")
@@ -553,27 +438,11 @@ def train(args):
         val_loss_log = np.empty((0, 2))
 
     for epoch in range(start_epoch, args.num_epochs):
-        MetricLog_train = MetricAccumulator("train")
-        MetricLog_val   = MetricAccumulator("val")
         print(f'Epoch #{epoch:2d} ............... {args.exp_name} ...............')
         torch.cuda.empty_cache()
-        if augmenter is not None:
-            last_val_loss = val_loss_history[-1] if val_loss_history else None
-            augmenter.update_state(current_epoch=epoch, val_loss=last_val_loss)
-        # ---- MaskAugmenter 스케줄 업데이트 ----
-        if mask_augmenter is not None:
-            last_val_loss = val_loss_history[-1] if val_loss_history else None
-            mask_augmenter.update_state(current_epoch=epoch, val_loss=last_val_loss)
-        
-        train_loader = create_data_loaders(
-            data_path=args.data_path_train, 
-            args=args, 
-            shuffle=True, 
-            augmenter=augmenter, # 업데이트된 augmenter 전달
-            mask_augmenter=mask_augmenter,
-            is_train=True,      # ★ train만 True
-            domain_filter=getattr(args, "domain_filter", None),
-        )
+ 
+        train_loader = create_data_loaders(args=args, split="train", shuffle=True, is_train=True)
+ 
 
         # ── epoch별 accum_steps 갱신 ──
         accum_steps_epoch = _accum_steps_for_epoch(epoch)
@@ -581,14 +450,12 @@ def train(args):
             print(f"[GradAccum] Epoch {epoch}: accum_steps {accum_steps} → {accum_steps_epoch}")
             accum_steps = accum_steps_epoch
 
-        train_loss, train_time = train_epoch(args, epoch, model,
-                                             train_loader, optimizer, scheduler,
-                                             loss_type, ssim_metric, MetricLog_train,
-                                             scaler, amp_enabled,use_deepspeed,
-                                             accum_steps)
-        val_loss,val_ssim, num_subjects, reconstructions, targets, inputs, val_time = validate(args, model, val_loader,
-                                                                                        MetricLog_val, epoch,
-                                                                                        loss_type, ssim_metric)
+        train_loss, train_time = train_epoch(
+            args, epoch, model, train_loader, optimizer, scheduler,
+            loss_fn, scaler, amp_enabled, use_deepspeed, accum_steps
+        )
+        val_loss, val_dice, val_iou, val_time = validate(args, model, val_loader, epoch, loss_fn)
+
         # ✨ val_loss 기록 (스케줄러 및 체크포인트용)
         val_loss_history.append(val_loss)
 
@@ -601,10 +468,10 @@ def train(args):
         val_loss = torch.tensor(val_loss).cuda(non_blocking=True)
         num_subjects = torch.tensor(num_subjects).cuda(non_blocking=True)
 
-        # is_new_best = val_loss < best_val_loss
-        is_new_best = val_ssim > best_val_ssim
+        # inverse에서는 dice 기준으로 best 선택 (원하면 iou/val_loss로 변경)
+        is_new_best = val_dice > best_val_ssim
         best_val_loss = min(best_val_loss, val_loss)
-        best_val_ssim = max(best_val_ssim, val_ssim)
+        best_val_ssim = max(best_val_ssim, val_dice)
 
         # ✨ save_model에 val_loss_history 추가 (상태 저장을 위해)
         checkpoint = {
@@ -632,73 +499,30 @@ def train(args):
             else:
                 scheduler.step()
 
-        # ---------------- W&B 에폭 로그 (카테고리별) ----------------
+        # ---------------- W&B epoch log (간단) ----------------
         if getattr(args, "use_wandb", False) and wandb:
-
-            MetricLog_train.log(epoch*dup_mul)
-            MetricLog_val.log(epoch*dup_mul)
-            # 추가 전역 정보(learning-rate 등)만 개별로 저장
-            if getattr(args, "wandb_use_visLogging", False) and wandb:
-                print("visual Logging...")
-                log_epoch_samples(reconstructions, targets,
-                                step=epoch*dup_mul,
-                                max_per_cat=args.max_vis_per_cat)   # ← config 값 사용
-            
-            wandb.log({"epoch": epoch,
-                       "lr": optimizer.param_groups[0]['lr']}, step=epoch*dup_mul)
-            
-            if getattr(args, "wandb_use_receptiveField", False) and wandb:
-                # ┕ [추가] 매 에폭의 검증 단계 후, ERF를 계산하고 W&B에 로깅합니다.
-                # crop 안할시 receptive Field 계산 불가능 -> 이거 해결용..
-                print("Calculating and logging effective receptive field...")
-                log_receptive_field(
-                    model=model,
-                    data_loader=val_loader,
-                    epoch=epoch,
-                    device=device
-                )
-                print("Effective receptive field logged to W&B.")
-
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": float(train_loss),
+                    "val/loss": float(val_loss),
+                    "val/dice": float(val_dice),
+                    "val/iou": float(val_iou),
+                    "lr": optimizer.param_groups[0]["lr"] if optimizer else 0.0,
+                },
+                step=epoch*dup_mul
+            )
             if is_new_best:
                 wandb.save(str(args.exp_dir / "best_model.pt"))
-
-        # ───────── Leaderboard 평가 트리거 ─────────
-        if lb_enable and (epoch + 1) % lb_every == 0:
-            print(f"[LeaderBoard] Epoch {epoch+1}: reconstruct & eval 시작")
-            t0 = time.perf_counter()
-            ssim = run_leaderboard_eval(
-                model_ckpt_dir=args.exp_dir,
-                leaderboard_root=Path(eval_cfg["leaderboard_root"]),
-                gpu=args.GPU_NUM,
-                batch_size=eval_cfg["batch_size"],
-                output_key=eval_cfg["output_key"],
-            )
-            dt = time.perf_counter() - t0
-            print(f"[LeaderBoard] acc4={ssim['acc4']:.4f}  acc8={ssim['acc8']:.4f}  "
-                  f"mean={ssim['mean']:.4f}  ({dt/60:.1f} min)")
-
-            # ─ W&B 로깅 ─
-            if getattr(args, "use_wandb", False) and wandb:
-                wandb.log({
-                    "leaderboard/ssim_acc4": ssim["acc4"],
-                    "leaderboard/ssim_acc8": ssim["acc8"],
-                    "leaderboard/ssim_mean": ssim["mean"],
-                    "leaderboard/epoch":     epoch,
-                    "leaderboard/time_min":  dt/60,
-                }, step=epoch*dup_mul)
                                 
         print(
-            f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
-            f'ValLoss = {val_loss:.4g} ValSSIM = {val_ssim:.4g} TrainTime = {train_time:.4f}s ValTime = {val_time:.4f}s',
+            f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] '
+            f'TrainLoss = {train_loss:.4g} ValLoss = {val_loss:.4g} '
+            f'ValDice = {val_dice:.4g} ValIoU = {val_iou:.4g} '
+            f'TrainTime = {train_time:.2f}s ValTime = {val_time:.2f}s',
         )
 
-        if is_new_best:
-            print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@NewRecord@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
-            start = time.perf_counter()
-            save_reconstructions(reconstructions, args.val_dir, targets=targets, inputs=inputs)
-            print(
-                f'ForwardTime = {time.perf_counter() - start:.4f}s',
-            )
+        #  (원하면 DLP용 “몇 장 PNG 저장”으로 별도 구현)
 
         # ────────── epoch 루프 내부, val 계산·로그 이후 ──────────
         current_epoch = epoch + 1         # 사람 눈금 1-base
@@ -707,7 +531,7 @@ def train(args):
         torch.cuda.empty_cache()
         if early_enabled and current_epoch in stage_table:
             req = stage_table[current_epoch]
-            if val_ssim < req:
+            if val_dice < req:
                 print(f"[EarlyStop] Epoch {current_epoch}: "
-                    f"val_ssim={val_ssim:.4f} < target={req:.4f}. 학습 중단!")
+                    f"val_dice={val_dice:.4f} < target={req:.4f}. 학습 중단!")
                 break                     # for epoch 루프 탈출

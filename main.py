@@ -1,6 +1,7 @@
+# main.py
+
 """
 Hydra + W&B 진입 스크립트
-FastMRI_challenge/main.py
 """
 from omegaconf import DictConfig, OmegaConf
 import math, operator
@@ -40,12 +41,13 @@ def _flatten_cfg_to_args(cfg: DictConfig) -> SimpleNamespace:
         for k, v in node.items():
             new_key = f"{prefix}_{k}" if prefix else k
 
-            # special-case: dict를 '통째로' 보존할 키들
-            PRESERVE = {"model", "data", "LRscheduler", "LossFunction", 
+            PRESERVE = {
+                        "task",
+                        "model", "data", "LRscheduler", "LossFunction",
                         "optimizer", "compressor", "collator", "sampler",
                         "evaluation", "early_stop", "maskDuplicate","maskAugment"
                         ,"aug", "centerCropPadding", "deepspeed",
-                        
+                        "image", "filters",
                         }
             # ─ Gradient Accum Scheduler dict 보존 (training.grad_accum_scheduler) ─
             if k == "grad_accum_scheduler" and isinstance(v, Mapping):
@@ -72,11 +74,13 @@ def _flatten_cfg_to_args(cfg: DictConfig) -> SimpleNamespace:
     args.max_vis_per_cat = container["wandb"]["max_vis_per_cat"]
     args.deepspeed = container["training"]["deepspeed"]
 
-    # 4) Path 변환: data_path_* 를 Path 객체로 변경하여 load_data 에서의 '/' 연산 오류 방지
-    if hasattr(args, 'data_path_train'):
-        args.data_path_train = Path(args.data_path_train)
-    if hasattr(args, 'data_path_val'):
-        args.data_path_val     = Path(args.data_path_val)
+    # ✅ DLP TrainPack 경로도 Path로 변환 (Dataset에서 join할 때 편하게)
+    if hasattr(args, "data_trainpack_root"):
+        args.data_trainpack_root = Path(args.data_trainpack_root)
+    if hasattr(args, "data_manifest_csv"):
+        args.data_manifest_csv = Path(args.data_manifest_csv)
+    if hasattr(args, "data_splits_dir"):
+        args.data_splits_dir = Path(args.data_splits_dir)
 
     # 5) 결과 경로 세팅 (train.py 로직 반영) :contentReference[oaicite:1]{index=1}
     result_dir = Path(cfg.data.PROJECT_ROOT) / "result" / args.exp_name
@@ -101,24 +105,28 @@ def main(cfg: DictConfig):
 
     # ── 2. cfg → args 변환 -----------------------------------------------------
     args = _flatten_cfg_to_args(cfg)
-    
-    # ── 3. W&B 초기화 ----------------------------------------------------------
-    wandb.init(
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
-        name=args.exp_name,
-        config=OmegaConf.to_container(cfg, resolve=True),
-    )
 
-    # (선택) 모델 그래디언트 자동 로깅
-    # wandb.watch(log="all", log_freq=cfg.report_interval)
+    # ── 3. W&B 초기화 (조건부) -------------------------------------------------
+    if cfg.wandb.use_wandb:
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=args.exp_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+ 
+ 
+    # ── 4. 학습 (task 라우팅) -------------------------------------------------
+    task_name = getattr(cfg, "task", {}).get("name", "train")
+    print(f"[Task] {task_name}")
 
-    # ── 4. 학습 ---------------------------------------------------------------
-    train(args)   # utils.learning.train_part.train 호출 :contentReference[oaicite:2]{index=2}
+    # 지금은 train_part.py를 DLP용으로 바꾸기 전이므로 train(args)로 진입만 유지.
+    # 이후: if task_name == "inverse": train_inverse(args) 같은 분기 추천.
+    train(args)
 
     # ── 5. 마무리 -------------------------------------------------------------
-    wandb.finish()
-
+    if cfg.wandb.use_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main()

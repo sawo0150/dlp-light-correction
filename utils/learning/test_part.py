@@ -1,74 +1,65 @@
+# utils/learning/test_part.py
+
 import numpy as np
 import torch
 
 from tqdm import tqdm  # 추가
-from collections import defaultdict
-from utils.common.utils import save_reconstructions
 from utils.data.load_data import create_data_loaders
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
+from pathlib import Path
+import os
+import cv2
 
-def test(args, model, data_loader):
+def _sigmoid_to_u8(logits: torch.Tensor) -> np.ndarray:
+    probs = torch.sigmoid(logits).detach().cpu().numpy()  # [B,1,H,W]
+    probs = np.clip(probs, 0.0, 1.0)
+    u8 = (probs * 255.0).astype(np.uint8)
+    return u8
+
+
+def inference(args, model, data_loader, out_dir: Path):
     model.eval()
-    reconstructions = defaultdict(dict)
+    out_dir.mkdir(parents=True, exist_ok=True)
     
     with torch.no_grad():
         # 진행률 표시를 위한 tqdm 래퍼
-        for batch in tqdm(data_loader, desc=f"Reconstructing", ncols=70, leave=False):
-        # for (mask, kspace, _, _, fnames, slices) in data_loader:
-        # for batch in data_loader:
-            # forward 모드(6-튜플) / train 모드(7-튜플) 모두 지원
-            if len(batch) == 7:
-                mask, kspace, _, _, fnames, slices, _ = batch
-            else:
-                mask, kspace, _, _, fnames, slices = batch
-            kspace = kspace.cuda(non_blocking=True)
-            mask = mask.cuda(non_blocking=True)
-            output = model(kspace, mask)
-            # print(kspace.shape)
+        
+        for batch_idx, batch in tqdm(enumerate(data_loader), desc="Infer", ncols=70, leave=False, total=len(data_loader)):
+            x, y, meta = batch
+            x = x.cuda(non_blocking=True)
+            logits = model(x)  # [B,1,H,W]
+            pred_u8 = _sigmoid_to_u8(logits)
 
-            for i in range(output.shape[0]):
-                reconstructions[fnames[i]][int(slices[i])] = output[i].cpu().numpy()
-
-    for fname in reconstructions:
-        reconstructions[fname] = np.stack(
-            [out for _, out in sorted(reconstructions[fname].items())]
-        )
-    return reconstructions, None
+            # save each sample
+            B = pred_u8.shape[0]
+            for i in range(B):
+                sample_key = meta["sample_key"][i] if isinstance(meta["sample_key"], (list, tuple)) else meta["sample_key"]
+                out_path = out_dir / f"{sample_key}.png"
+                if cv2 is None:
+                    raise RuntimeError("opencv-python required to save png in inference().")
+                cv2.imwrite(str(out_path), pred_u8[i, 0])
 
 
-def forward(args):
+def run_inference(args):
 
     device = torch.device(f'cuda:{args.GPU_NUM}' if torch.cuda.is_available() else 'cpu')
     torch.cuda.set_device(device)
-    # print ('Current cuda device ', torch.cuda.current_device())
-
-    # model = VarNet(num_cascades=args.cascade, 
-    #                chans=args.chans, 
-    #                sens_chans=args.sens_chans)
-
+    
     # 모델 설정은 args.model dict (_target_ + 파라미터) 기준으로 instantiate
-    model_cfg = getattr(args, "model", {"_target_": "utils.model.varnet.VarNet"})
-    model = instantiate(OmegaConf.create(model_cfg),
-                        use_checkpoint=getattr(args, "training_checkpointing", False))
+    model_cfg = getattr(args, "model")
+    model = instantiate(OmegaConf.create(model_cfg))
     model.to(device=device)
-    
-    checkpoint = torch.load(args.exp_dir / 'best_model.pt', map_location='cpu', weights_only=False)
-    # print("checkpoint_epoch : ", checkpoint['epoch'], "best_val_loss : ", checkpoint['best_val_loss'].item())
-    best_loss = checkpoint.get('best_val_loss',
-                               checkpoint.get('best_train_loss', None))
-    if best_loss is not None:
-        best_loss_val = best_loss.item() if torch.is_tensor(best_loss) else best_loss
-        print(f"checkpoint_epoch : {checkpoint['epoch']}   best_loss : {best_loss_val:.4g}")
-    else:
-        print(f"checkpoint_epoch : {checkpoint['epoch']}   (best-loss key 없음)")
 
-    model.load_state_dict(checkpoint['model'])
-    
-    # print(args.batch_size)
-    forward_loader = create_data_loaders(data_path = args.data_path, args = args, isforward = True)
-    reconstructions, inputs = test(args, model, forward_loader)
-    save_reconstructions(reconstructions, args.forward_dir, inputs=inputs)
+    ckpt_path = args.exp_dir / "best_model.pt"
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(checkpoint["model"])
+    print(f"[Inference] loaded: {ckpt_path} (epoch={checkpoint.get('epoch', -1)})")
 
-    del forward_loader
+    # test split loader
+    test_loader = create_data_loaders(args=args, split="test", shuffle=False, is_train=False)
+    out_dir = Path(args.val_loss_dir) / "inference_test"
+    inference(args, model, test_loader, out_dir=out_dir)
+
+    del test_loader
     torch.cuda.empty_cache()

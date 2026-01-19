@@ -1,0 +1,18 @@
+# configs/data/local_trainpack.yaml
+
+# repo root (결과 저장 기준으로 계속 사용 중이면 유지)
+PROJECT_ROOT: ${hydra:runtime.cwd}
+
+# ✅ TrainPack 경로
+trainpack_root: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280
+manifest_csv: ${data.trainpack_root}/manifest.csv
+splits_dir: ${data.trainpack_root}/splits
+
+# ✅ split 소스: manifest의 split 컬럼을 쓰는지, splits/*.txt를 쓰는지
+split_source: "manifest"   # ["manifest", "txt"]
+
+# split 선택
+split: "train"             # ["train","val","test"]
+
+# mode 필터
+modes: ["binary", "gray"]
