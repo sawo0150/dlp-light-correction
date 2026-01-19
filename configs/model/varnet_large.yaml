@@ -1,0 +1,6 @@
+# VarNet 확장 버전
+_target_: utils.model.varnet.VarNet
+
+num_cascades: 8
+chans: 18
+sens_chans: 8

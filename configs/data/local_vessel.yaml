@@ -1,0 +1,12 @@
+data_path_train: /root/Data/train/
+data_path_val:   /root/Data/val/
+data_path_eval: /root/Data/leaderboard/
+PROJECT_ROOT: /root/
+repo_ROOT: /root/2025_GeekSeek/
+
+
+mask_thresholds:
+  brain_x4: 5e-5
+  brain_x8: 5e-5
+  knee_x4:  2e-5
+  knee_x8:  2e-5

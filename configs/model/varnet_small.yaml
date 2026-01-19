@@ -1,0 +1,6 @@
+# VarNet 경량 버전
+_target_: utils.model.varnet.VarNet
+
+num_cascades: 1
+chans: 9
+sens_chans: 4

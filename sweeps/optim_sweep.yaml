@@ -1,0 +1,37 @@
+# sweeps/optim_sweep.yaml  
+# wandb sweep sweeps/optim_sweep.yaml로 실행하면 됨
+method: grid
+name: optim_grid_2025
+project: optim_sweep        # ✅ 원하는 프로젝트 이름
+
+parameters:
+  optimizer:
+    values:
+      - sgd
+      - sgd_nesterov
+      - rmsprop
+      - adagrad
+      - adadelta
+      - adam
+      - adamw
+      - radam
+      - nadam
+      - lion
+      - lamb
+      - adafactor
+      - adabelief
+      - sophia_g
+
+program: sweeps/train_entry.py     # ← 래퍼를 entrypoint 로
+command:
+  - ${env}
+  - python  
+  - ${program}
+  # - "--config-name=sweeping_default"
+  - "--config-name=train"
+  - ${args}                         # "--optimizer adam" 형태로 확장
+
+
+
+
+
