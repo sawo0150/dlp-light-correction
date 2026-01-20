@@ -116,6 +116,10 @@ class TrainPackManifestDataset(Dataset):
         self.seed = int(seed)
         self.shuffle_thr = bool(shuffle_thr)
 
+        # ✅ [FIX] random_one / dir caching에 필요한 멤버 초기화
+        self._dir_cache: Dict[str, List[str]] = {}
+        self._rng = random.Random(self.seed)
+
         # index_filename 인자는 create_data_loaders에서 넘어오거나 기본값 사용
         index_filename = "thr_file_index.json"
 
@@ -332,16 +336,45 @@ def create_data_loaders(
     DLP TrainPack dataloader factory.
     - split: "train"/"val"/"test"
     """
-    task_cfg = getattr(args, "task", {})
-    data_cfg = getattr(args, "data", {})
-    image_cfg = getattr(args, "image", {})
-    filters_cfg = getattr(args, "filters", {})
+    task_cfg    = getattr(args, "task", {}) or {}
+    data_cfg    = getattr(args, "data", {}) or {}
+    image_cfg   = getattr(args, "image", {}) or {}
+    filters_cfg = getattr(args, "filters", {}) or {}
+
+    # ✅ task.inverse.data 에서 data policy를 읽는다 (우선순위: task > filters > default)
+    inv_cfg = {}
+    if isinstance(task_cfg, dict):
+        inv_cfg = task_cfg.get("inverse", {}) or {}
+    inv_data_cfg = {}
+    if isinstance(inv_cfg, dict):
+        inv_data_cfg = inv_cfg.get("data", {}) or {}
+
+    # split_source: task.inverse.data.split_source > args.data_split_source > "manifest"
+    split_source = inv_data_cfg.get(
+        "split_source",
+        getattr(args, "data_split_source", "manifest")
+    )
+
+    # modes: task.inverse.data.modes > filters.modes > args.data_modes > ["binary","gray"]
+    modes = inv_data_cfg.get("modes", None)
+    if modes is None:
+        modes = (filters_cfg.get("modes", None) if isinstance(filters_cfg, dict) else None)
+    if modes is None:
+        modes = list(getattr(args, "data_modes", ["binary", "gray"]))
+    else:
+        modes = list(modes)
+
+    # ✅ filters_cfg에 task 쪽 allow/qc를 merge해서 Dataset이 그대로 쓰게 함
+    merged_filters = dict(filters_cfg) if isinstance(filters_cfg, dict) else {}
+    if "dataset_allow" in inv_data_cfg:
+        merged_filters["dataset_allow"] = inv_data_cfg.get("dataset_allow", [])
+    if "qc_filter" in inv_data_cfg:
+        merged_filters["qc_filter"] = inv_data_cfg.get("qc_filter", "")
 
     trainpack_root = Path(getattr(args, "data_trainpack_root"))
     manifest_csv = Path(getattr(args, "data_manifest_csv"))
     splits_dir = Path(getattr(args, "data_splits_dir"))
-    split_source = getattr(args, "data_split_source", "manifest")
-    modes = list(getattr(args, "data_modes", ["binary", "gray"]))
+    
     ds = TrainPackManifestDataset(
         trainpack_root=trainpack_root,
         manifest_csv=manifest_csv,
@@ -351,10 +384,13 @@ def create_data_loaders(
         modes=modes,
         task_cfg=task_cfg,
         image_cfg=image_cfg,
-        filters_cfg=filters_cfg,
-       seed=int(getattr(args, "seed", 1234)),
+        filters_cfg=merged_filters,
+        seed=int(getattr(args, "seed", 1234)),
         shuffle_thr=bool(is_train),
     )
+
+    # ✅ 확인용 로그 (binary만 들어갔는지, dataset 크기)
+    print(f"[DataLoader] split={split} split_source={split_source} modes={modes} len={len(ds)}")
 
     batch_size = int(getattr(args, "batch_size", 4)) if is_train else int(getattr(args, "val_batch_size", 4))
     num_workers = int(getattr(args, "num_workers", 0))

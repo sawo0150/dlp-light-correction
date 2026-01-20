@@ -4,12 +4,12 @@ defaults:
   - _self_
 
   # ✅ DLP task 선택 (inverse부터)
-  - task: inverse
+  - task: inverse_1
 
   # ✅ DLP 모델/데이터/로스는 새 그룹으로 분리
   # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)
   - model: dlp_unet_small
-  - data: local_trainpack
+  - data: localLaptop_trainpack       # local_trainpack or localLaptop_trainpack
   - LossFunction: BCEWithLogitsDice
 
   # 아래는 기존 hydra 뼈대 재사용용 (필요 없으면 점진적으로 제거)
@@ -22,8 +22,8 @@ defaults:
 
 # === 공통 학습 하이퍼파라미터 ===
 GPU_NUM: 0
-batch_size: 2
-val_batch_size: 2
+batch_size: 1
+val_batch_size: 1
 training_accum_steps: 4 # 🟢 추가: 1장씩 4번 모아서 업데이트 (실제 배치 4 효과)
 training_amp: true   # 🔴 False (또는 주석) -> true 로 변경
 num_epochs: 50
@@ -62,9 +62,3 @@ hydra:
     dir: ../result/${exp_name}/hydra_sweep/${now:%Y-%m-%d}_${now:%H-%M-%S}
   job:
     chdir: false  # 코드가 실행되는 작업 디렉토리를 변경하지 않음 (경로 에러 방지)
-
-# ✅ (선택) 실험 태그/필터: TrainPack manifest 기반 필터링 옵션
-filters:
-  modes: ["binary", "gray"]   # 또는 ["binary"]만 먼저
-  dataset_allow: []          # 비워두면 전체
-  qc_filter: ""              # 예: "qc__ncc_mask1280_ld1280>0.2"

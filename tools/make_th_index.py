@@ -7,7 +7,8 @@ from collections import defaultdict
 
 # ---------------------------------------------------------
 # 설정: 데이터셋 경로를 본인 환경에 맞게 수정하세요
-TRAINPACK_ROOT = "/home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280"
+# TRAINPACK_ROOT = "/home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280"
+TRAINPACK_ROOT = "/home/wosasa/Desktop/25-1_UROP/MiniPack_allinone_COPY_1280"
 # 스캔할 하위 폴더들 (여기에 있는 모든 이미지를 긁어옵니다)
 TARGET_DIRS = [
     "thr/binary/random",

@@ -1,7 +1,7 @@
-# configs/task/inverse.yaml
-# Inverse-1: thr(=thresholded LD) -> mask
+# configs/task/inverse_1.yaml
+# Inverse_1: thr(=thresholded LD) -> mask
 
-name: inverse
+name: inverse_1
 
 inverse:
   # input policy
@@ -19,3 +19,10 @@ inverse:
   # target policy
   target_key: "mask_1280"        # manifest의 mask_1280_path 사용
   mode_condition: "from_manifest" # or force: "binary"/"gray"
+
+  # ✅ task가 사용할 data subset/policy를 여기서 선언
+  data:
+    modes: ["binary"]               # ✅ binary, gray 
+    split_source: "manifest"        # "manifest" | "txt" (원하면)
+    dataset_allow: []               # 특정 dataset만 허용할 때
+    qc_filter: ""                   # (아직 미구현이면 비워두기)
