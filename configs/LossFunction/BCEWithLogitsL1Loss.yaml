@@ -1,0 +1,6 @@
+# configs/LossFunction/BCEWithLogitsL1Loss.yaml
+
+_target_: utils.common.loss_function.BCEWithLogitsL1Loss
+w_bce: 1.0
+w_l1: 1.0
+# pos_weight: 2.0   # (선택) 양성 픽셀이 희소하면 켜도 됨
