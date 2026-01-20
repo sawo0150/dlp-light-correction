@@ -1,9 +1,0 @@
-# configs/model/dlp_unet_small.yaml
-
-_target_: utils.model.unet.Unet   # TODO: 실제 클래스명으로 교체
-
-in_chans: 1
-out_chans: 1
-chans: 32
-num_pool_layers: 4
-drop_prob: 0.0

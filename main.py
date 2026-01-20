@@ -12,7 +12,7 @@ OmegaConf.register_new_resolver(
 )
 import hydra
 import torch
-import sys
+import sys, os
 import wandb
 from collections.abc import Mapping
 from pathlib import Path
@@ -114,11 +114,15 @@ def main(cfg: DictConfig):
         wandb_dir = args.val_loss_dir / "wandb_logs"
         wandb_dir.mkdir(parents=True, exist_ok=True)
         
+        # ✅ (권장) WANDB_DIR 환경변수도 같이 지정해두면 더 확실함
+        os.environ["WANDB_DIR"] = str(wandb_dir)
+         
         wandb.init(
             project=wandb_cfg.project,
             entity=wandb_cfg.entity,
             name=args.exp_name,
             config=OmegaConf.to_container(cfg, resolve=True),
+            dir=str(wandb_dir),  # ✅ 이거 없으면 ./wandb가 CWD(repo 루트)에 생김
         )
  
     # ── 4. 학습 (task 라우팅) -------------------------------------------------

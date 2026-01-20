@@ -112,3 +112,33 @@ class BCEWithLogitsLoss(nn.Module):
         if target.dim() == 3:
             target = target.unsqueeze(1)
         return self.loss(logits, target.float())
+
+
+class BCEWithLogitsL1Loss(nn.Module):
+    """
+    loss = w_bce * BCEWithLogits(logits, target) + w_l1 * L1(sigmoid(logits), target)
+
+    - BCEWithLogits: raw logits를 직접 사용 (안정적)
+    - L1: 확률(probs) 공간에서의 절대오차(경계/면적 차이를 부드럽게 페널티)
+    """
+    def __init__(self, w_bce: float = 1.0, w_l1: float = 1.0, pos_weight: float | None = None):
+        super().__init__()
+        self.w_bce = float(w_bce)
+        self.w_l1 = float(w_l1)
+
+        if pos_weight is None:
+            self.bce = nn.BCEWithLogitsLoss()
+        else:
+            pw = torch.tensor([float(pos_weight)])
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=pw)
+        self.l1 = nn.L1Loss()
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        target = target.float()
+
+        bce = self.bce(logits, target)
+        probs = torch.sigmoid(logits)
+        l1 = self.l1(probs, target)
+        return self.w_bce * bce + self.w_l1 * l1

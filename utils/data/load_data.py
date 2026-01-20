@@ -24,6 +24,28 @@ except Exception:
     Image = None
 
 
+def _resize_u8(img_u8: np.ndarray, out_size: int, is_mask: bool) -> np.ndarray:
+    """
+    Resize uint8 HxW -> out_size x out_size.
+    - is_mask=True : nearest (label preservation)
+    - is_mask=False: area (downsample friendly) / linear fallback
+    """
+    h, w = img_u8.shape[:2]
+    if h == out_size and w == out_size:
+        return img_u8
+
+    if cv2 is not None:
+        interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_AREA
+        return cv2.resize(img_u8, (out_size, out_size), interpolation=interp).astype(np.uint8)
+
+    if Image is not None:
+        pil = Image.fromarray(img_u8)
+        resample = Image.NEAREST if is_mask else Image.BILINEAR
+        pil = pil.resize((out_size, out_size), resample=resample)
+        return np.array(pil, dtype=np.uint8)
+
+    raise RuntimeError("Need opencv-python or pillow to resize images.")
+
 def _read_gray_u8(path: Path) -> np.ndarray:
     """
     Read grayscale PNG to uint8 HxW.
@@ -71,6 +93,8 @@ class TrainPackRow:
     sample_key: str
     dataset: str
     mode: str
+    mask_128_path: str
+    mask_160_path: str
     mask_1280_path: str
     ld_1280_aligned_path: str
     thr_random_dir: str
@@ -129,7 +153,11 @@ class TrainPackManifestDataset(Dataset):
         self.thr_random_policy = inv.get("thr_random_policy", "expand_all")  # expand_all|random_one
         self.thr_fixed_values = inv.get("thr_fixed_values", [])
         self.thr_stack = bool(inv.get("thr_stack", False))
-        self.target_key = inv.get("target_key", "mask_1280")
+        self.target_key = inv.get("target_key", "mask_1280")       # "mask_128" | "mask_160" | "mask_1280"
+
+        # ✅ on-the-fly resize 설정 (task.inverse.preprocess.out_size 우선)
+        pre = inv.get("preprocess", {}) or {}
+        self.out_size = int(pre.get("out_size", image_cfg.get("size", 1280)))
 
         # image settings
         self.normalize = image_cfg.get("normalize", "0_1")
@@ -176,6 +204,8 @@ class TrainPackManifestDataset(Dataset):
                         sample_key=row["sample_key"],
                         dataset=row.get("dataset", ""),
                         mode=row.get("mode", ""),
+                        mask_128_path=row.get("mask_128_path", ""),
+                        mask_160_path=row.get("mask_160_path", ""),
                         mask_1280_path=row.get("mask_1280_path", ""),
                         ld_1280_aligned_path=row.get("ld_1280_aligned_path", ""),
                         thr_random_dir=row.get("thr_random_dir", ""),
@@ -238,13 +268,25 @@ class TrainPackManifestDataset(Dataset):
         k = sorted(m.keys(), key=lambda x: int(x) if str(x).isdigit() else 999999)[0]
         return self.root / m[k]
 
+    def _resolve_target_path(self, r: TrainPackRow) -> Path:
+        """
+        target_key ("mask_128" | "mask_160" | "mask_1280")에 따라 manifest 경로 선택
+        """
+        key = (self.target_key or "mask_1280").strip()
+        if key == "mask_128":
+            return self.root / r.mask_128_path
+        if key == "mask_160":
+            return self.root / r.mask_160_path
+        # default
+        return self.root / r.mask_1280_path
+
     def _build_items(self, rows: List[TrainPackRow]) -> List[Dict]:
         items: List[Dict] = []
 
         print(f"[Dataset] Parsing metadata for {len(rows)} subjects (Indexed Lookup)...")
        
         for r in tqdm(rows, desc="Building Dataset", ncols=80):
-            target = self.root / r.mask_1280_path
+            target = self._resolve_target_path(r)
             
             # (1) ld_1280 모드
             if self.input_source == "ld_1280_aligned":
@@ -307,6 +349,12 @@ class TrainPackManifestDataset(Dataset):
         x_u8 = _read_gray_u8(x_path)
         y_u8 = _read_gray_u8(y_path)
 
+        # ✅ on-the-fly resize to out_size
+        # x(thr/ld): area (downsample), y(mask): nearest (label)
+        if self.out_size is not None:
+            x_u8 = _resize_u8(x_u8, self.out_size, is_mask=False)
+            y_u8 = _resize_u8(y_u8, self.out_size, is_mask=True)
+
         x = _u8_to_float(x_u8, self.normalize)
         y = _u8_to_float(y_u8, self.normalize)
         if self.binarize_target:
@@ -322,6 +370,8 @@ class TrainPackManifestDataset(Dataset):
             "x_path": str(x_path),
             "y_path": str(y_path),
             "input_source": self.input_source,
+            "out_size": int(self.out_size),
+            "target_key": str(self.target_key),
         }
         return x, y, meta
 
@@ -375,6 +425,24 @@ def create_data_loaders(
     manifest_csv = Path(getattr(args, "data_manifest_csv"))
     splits_dir = Path(getattr(args, "data_splits_dir"))
     
+    # ✅ task.inverse.data에서 modes/split_source를 읽도록 (우선순위: task > 기존 args)
+    inv_cfg = (task_cfg.get("inverse", {}) if isinstance(task_cfg, dict) else {}) or {}
+    inv_data_cfg = (inv_cfg.get("data", {}) if isinstance(inv_cfg, dict) else {}) or {}
+
+    split_source = inv_data_cfg.get("split_source", getattr(args, "data_split_source", "manifest"))
+    modes = inv_data_cfg.get("modes", None)
+    if modes is None:
+        modes = list(getattr(args, "data_modes", ["binary", "gray"]))
+    else:
+        modes = list(modes)
+
+    # ✅ dataset_allow/qc_filter도 task에 있으면 filters_cfg로 merge
+    merged_filters = dict(filters_cfg) if isinstance(filters_cfg, dict) else {}
+    if "dataset_allow" in inv_data_cfg:
+       merged_filters["dataset_allow"] = inv_data_cfg.get("dataset_allow", [])
+    if "qc_filter" in inv_data_cfg:
+        merged_filters["qc_filter"] = inv_data_cfg.get("qc_filter", "")
+
     ds = TrainPackManifestDataset(
         trainpack_root=trainpack_root,
         manifest_csv=manifest_csv,
@@ -389,8 +457,8 @@ def create_data_loaders(
         shuffle_thr=bool(is_train),
     )
 
-    # ✅ 확인용 로그 (binary만 들어갔는지, dataset 크기)
-    print(f"[DataLoader] split={split} split_source={split_source} modes={modes} len={len(ds)}")
+    print(f"[DataLoader] split={split} modes={modes} split_source={split_source} len={len(ds)} "
+          f"target_key={inv_cfg.get('target_key','')} out_size={inv_cfg.get('preprocess',{}).get('out_size','')}")
 
     batch_size = int(getattr(args, "batch_size", 4)) if is_train else int(getattr(args, "val_batch_size", 4))
     num_workers = int(getattr(args, "num_workers", 0))
