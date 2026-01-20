@@ -7,6 +7,8 @@ import torch.nn as nn
 import time, math
 from pathlib import Path
 from typing import Dict, Optional
+from importlib import import_module
+import inspect
 
 try:
     import wandb
@@ -52,7 +54,7 @@ def _dice_iou_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float
  
 def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
                 loss_fn,
-                scaler, amp_enabled, use_deepspeed, accum_steps):
+                scaler, amp_enabled, accum_steps):  # [수정] use_deepspeed 제거
     # print(sum(p.numel() for p in model.parameters()))
     # from utils.model.feature_varnet.modules import DLKAConvBlock
     # for n,m in model.named_modules():
@@ -102,24 +104,16 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
         # print("max memory_reserved MB:", torch.cuda.torch.cuda.max_memory_reserved() / 1024**2)
         # ─── Accumulation ──────────────────────────────────────────────
         if iter % accum_steps == 0:
-            if use_deepspeed:
-                model.zero_grad()
-            else:
-                optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True) # [수정] DeepSpeed 분기 제거
 
-        if use_deepspeed:
-            model.backward(loss)
-        elif amp_enabled:
+        if amp_enabled:
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
         # step & update?
         if (iter + 1) % accum_steps == 0 or (iter + 1) == len_loader:
-            if use_deepspeed:
-                model.step()
-                model.zero_grad()
-            elif amp_enabled:
+            if amp_enabled:
                 # # unscale / clip_grad 등 필요 시 여기서
                 # scaler.step(optimizer)
                 # scaler.update()
@@ -146,11 +140,10 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
 
-            # ▶ DeepSpeed 엔진은 model.step() 안에서
             #   scheduler.step() 을 이미 호출하므로 별도 호출 금지
-            if (not use_deepspeed) and scheduler is not None:
-                if isinstance(scheduler, (torch.optim.lr_scheduler.OneCycleLR,
-                                          torch.optim.lr_scheduler.CyclicLR)):
+            if scheduler is not None:  # [수정] 조건문 단순화
+                 if isinstance(scheduler, (torch.optim.lr_scheduler.OneCycleLR,
+                                           torch.optim.lr_scheduler.CyclicLR)):
                     scheduler.step()
 
         total_loss += float(loss.detach().item()) * accum_steps
@@ -281,93 +274,60 @@ def train(args):
     loss_fn = instantiate(OmegaConf.create(loss_cfg)).to(device=device)
     print(f"[Hydra] loss_func ▶ {loss_fn}")
 
-    # ── 1. Optimizer 선택 (fallback: Adam) ─────────────────────────────
-    # DeepSpeed 활성화 여부를 미리 확인
-    ds_cfg = getattr(args, "deepspeed", None)
-    use_deepspeed = ds_cfg is not None and ds_cfg.get("enable", False)
-
+    # ──────────────────────────────────────────────────────────────────────────
+    # ✅ [FIX] Optimizer 초기화 (UnboundLocalError 해결)
+    # 스케줄러 생성 전에 반드시 Optimizer가 있어야 합니다.
+    # ──────────────────────────────────────────────────────────────────────────
+    optim_cfg = getattr(args, "optimizer")
+    # Hydra instantiate로 생성 (params 인자로 모델 파라미터 전달)
+    optimizer = instantiate(OmegaConf.create(optim_cfg), params=model.parameters())
+    print(f"[Hydra] optimizer ▶ {optimizer.__class__.__name__}")
+    # ──────────────────────────────────────────────────────────────────────────
     temp_loader = create_data_loaders(args=args, split="train", shuffle=True, is_train=True)
 
-    # ❷ DeepSpeed 스케줄러 파라미터 동적 채우기
-    ds_cfg = getattr(args, "deepspeed", None)
-    if ds_cfg and ds_cfg["config"].get("scheduler"):
-        sched_p = ds_cfg["config"]["scheduler"]["params"]
-        sched_p["warmup_num_steps"] = args.warmup_epochs * effective_steps
-        sched_p["total_num_steps"]  = args.num_epochs    * effective_steps
-
     # ──────────────── LR Scheduler (옵션) ────────────────
-    # DeepSpeed가 활성화된 경우, DeepSpeed의 scheduler 설정을 사용
-    if use_deepspeed:
-        # DeepSpeed가 ds_cfg에서 scheduler를 읽어오므로, 여기서는 별도로 instantiate하지 않음
-        scheduler = None # DeepSpeed가 자체적으로 스케줄러를 관리하도록 None으로 설정
-        # ds_cfg["config"]["scheduler"] 블록을 직접 사용할 것임
-    else:
-        # 0) Config → OmegaConf
-        sched_cfg_raw = getattr(args, "LRscheduler", None)
-        scheduler = None
-        if sched_cfg_raw is not None:
-            sched_cfg = OmegaConf.create(sched_cfg_raw)   # dict → OmegaConf
+    # [수정] DeepSpeed 분기 제거하고 바로 Scheduler 생성 로직 수행
+    
+    # 0) Config → OmegaConf
+    sched_cfg_raw = getattr(args, "LRscheduler", None)
+    scheduler = None
+    if sched_cfg_raw is not None:
+        sched_cfg = OmegaConf.create(sched_cfg_raw)   # dict → OmegaConf
 
-            # 1) 공통 계산
-            temp_loader = create_data_loaders(
-                data_path=args.data_path_train,
-                args=args,
-                shuffle=True,
-                augmenter=None,
-                mask_augmenter=None,
-                is_train=True,      # ★ train만 True
-                domain_filter=getattr(args, "domain_filter", None),
+        print("[Info] Skip calculating exact effective_steps to save time.")
+        effective_steps = 1000 
+
+        # 2) target class 로드 & 시그니처 분석
+        target_path = sched_cfg["_target_"]
+        mod_name, cls_name = target_path.rsplit(".", 1)
+        SchedulerCls = getattr(import_module(mod_name), cls_name)
+        sig = inspect.signature(SchedulerCls.__init__)
+        valid_keys = set(sig.parameters.keys())       
+
+        # 3) 필요한 key만 conditionally 추가
+        if "effective_steps" in sched_cfg and "effective_steps" not in valid_keys:
+            del sched_cfg["effective_steps"]
+
+        # CyclicLR
+        if cls_name == "CyclicLR":
+            sched_cfg["effective_steps"] = effective_steps
+            sched_cfg["step_size_up"] = sched_cfg.get(
+                "step_size_up", effective_steps * 2
             )
-            effective_steps = math.ceil(len(temp_loader) / accum_steps)
-            del temp_loader
+            sched_cfg["max_lr"] = sched_cfg.get("max_lr", args.lr * 6)
 
-            # 2) target class 로드 & 시그니처 분석
-            target_path = sched_cfg["_target_"]
-            mod_name, cls_name = target_path.rsplit(".", 1)
-            SchedulerCls = getattr(import_module(mod_name), cls_name)
-            sig = inspect.signature(SchedulerCls.__init__)
-            valid_keys = set(sig.parameters.keys())        # 허용 인수 목록
+        # OneCycleLR
+        if cls_name == "OneCycleLR":
+            sched_cfg["effective_steps"] = effective_steps
+            sched_cfg["total_steps"] = sched_cfg.get(
+                "total_steps", effective_steps * args.num_epochs
+            )
+            sched_cfg["max_lr"] = sched_cfg.get("max_lr", args.lr * 10)
 
-            # 3) 필요한 key만 conditionally 추가
-            if "effective_steps" in sched_cfg and "effective_steps" not in valid_keys:
-                del sched_cfg["effective_steps"]
-
-            # CyclicLR
-            if cls_name == "CyclicLR":
-                sched_cfg["effective_steps"] = effective_steps
-                sched_cfg["step_size_up"] = sched_cfg.get(
-                    "step_size_up", effective_steps * 2
-                )
-                sched_cfg["max_lr"] = sched_cfg.get("max_lr", args.lr * 6)
-
-            # OneCycleLR
-            if cls_name == "OneCycleLR":
-                sched_cfg["effective_steps"] = effective_steps
-                sched_cfg["total_steps"] = sched_cfg.get(
-                    "total_steps", effective_steps * args.num_epochs
-                )
-                sched_cfg["max_lr"] = sched_cfg.get("max_lr", args.lr * 10)
-
-            # 4) instantiate (불필요 인수 제거 후)
-            clean_dict = {k: v for k, v in sched_cfg.items() if k in valid_keys or k.startswith("_")}
-            scheduler = instantiate(OmegaConf.create(clean_dict), optimizer=optimizer)
-            print(f"[Hydra] Scheduler ▶ {scheduler}")
-
-    # ── ❷ DeepSpeed 옵션 적용 ────────────────────────────────
-    print("[DeepSpeed] use_deepspeed",use_deepspeed)
-    print(ds_cfg)
-    if use_deepspeed:
-        import deepspeed                                       # :contentReference[oaicite:3]{index=3}
-        model, optimizer, scheduler, _ = deepspeed.initialize(
-            model=model,
-            optimizer=optimizer,      
-            model_parameters=model.parameters(),
-            config=ds_cfg["config"]
-        )
-        print("[DeepSpeed] enabled → ZeRO-Stage",
-              ds_cfg["config"]["zero_optimization"]["stage"])
-        print(f"[DeepSpeed] 최종 Optimizer: {optimizer.__class__.__name__}")
-        print(f"[DeepSpeed] 최종 LR Scheduler: {scheduler.__class__.__name__ if scheduler else 'None'}")
+        # 4) instantiate (optimizer 전달)
+        clean_dict = {k: v for k, v in sched_cfg.items() if k in valid_keys or k.startswith("_")}
+        scheduler = instantiate(OmegaConf.create(clean_dict), optimizer=optimizer)
+        print(f"[Hydra] Scheduler ▶ {scheduler}")
 
     # DLP inverse MVP에서는 augmenter/MaskAugmenter 기능은 일단 제거 (필요하면 나중에 DLP용으로 다시 추가)
     augmenter = None
@@ -452,7 +412,7 @@ def train(args):
 
         train_loss, train_time = train_epoch(
             args, epoch, model, train_loader, optimizer, scheduler,
-            loss_fn, scaler, amp_enabled, use_deepspeed, accum_steps
+            loss_fn, scaler, amp_enabled, accum_steps
         )
         val_loss, val_dice, val_iou, val_time = validate(args, model, val_loader, epoch, loss_fn)
 
@@ -466,7 +426,7 @@ def train(args):
 
         train_loss = torch.tensor(train_loss).cuda(non_blocking=True)
         val_loss = torch.tensor(val_loss).cuda(non_blocking=True)
-        num_subjects = torch.tensor(num_subjects).cuda(non_blocking=True)
+        # num_subjects = torch.tensor(num_subjects).cuda(non_blocking=True)
 
         # inverse에서는 dice 기준으로 best 선택 (원하면 iou/val_loss로 변경)
         is_new_best = val_dice > best_val_ssim

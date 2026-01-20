@@ -1,2 +1,0 @@
-_target_: utils.data.transforms.KspaceCenterCropPad
-target_size: ${..crop_size}

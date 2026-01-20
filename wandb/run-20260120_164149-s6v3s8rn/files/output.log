@@ -1,0 +1,30 @@
+[Task] inverse
+Current cuda device:  0
+[Hydra] training: accum_steps=4 checkpointing=False amp_enabled=True
+[Hydra] grad_clip: enable=False max_norm=1.0 norm_type=2
+[Hydra-eval] {}
+[Hydra-eval] early_enabled=False, stage_table={}
+[Hydra-model] model_cfg={'_target_': 'utils.model.unet.Unet', 'in_chans': 1, 'out_chans': 1, 'chans': 32, 'num_pool_layers': 4, 'drop_prob': 0.0}
+[Hydra] loss_func ▶ BCEWithLogitsDiceLoss(
+  (dice): DiceLoss()
+  (bce): BCEWithLogitsLoss()
+)
+[Hydra] optimizer ▶ AdamW
+[Dataset] Loading file index from /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/thr_file_index.json...
+[Dataset] Parsing metadata for 107975 subjects (Indexed Lookup)...
+Building Dataset: 100%|██████████████| 107975/107975 [00:01<00:00, 62639.72it/s]
+[Info] Skip calculating exact effective_steps to save time.
+[Hydra] Scheduler ▶ <torch.optim.lr_scheduler.CosineAnnealingLR object at 0x7c5f49e55cf0>
+[Resume] None
+[Data] trainpack_root: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280
+[Data] manifest_csv  : /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/manifest.csv
+[Hydra-eval] {}
+[Hydra-eval] lb_enable=False, lb_every=999999
+[Dataset] Loading file index from /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/thr_file_index.json...
+[Dataset] Parsing metadata for 5999 subjects (Indexed Lookup)...
+Building Dataset: 100%|█████████████████| 5999/5999 [00:00<00:00, 112953.48it/s]
+Epoch # 0 ............... dlp_inverse_thr2mask_baseline ...............
+[Dataset] Loading file index from /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/thr_file_index.json...
+[Dataset] Parsing metadata for 107975 subjects (Indexed Lookup)...
+Building Dataset: 100%|██████████████| 107975/107975 [00:01<00:00, 74284.55it/s]
+Epoch[ 0/50]/:   2%| | 1815/107975 [18:17<18:14:18,  1.62it/s, dice=0.

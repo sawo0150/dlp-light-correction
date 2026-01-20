@@ -1,7 +1,7 @@
 # configs/data/local_trainpack.yaml
 
 # repo root (결과 저장 기준으로 계속 사용 중이면 유지)
-PROJECT_ROOT: ${hydra:runtime.cwd}
+PROJECT_ROOT: /home/swpants05/Desktop/26-1_UROP
 
 # ✅ TrainPack 경로
 trainpack_root: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280

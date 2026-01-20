@@ -1,0 +1,11 @@
+[Task] inverse
+Current cuda device:  0
+[Hydra] training: accum_steps=1 checkpointing=False amp_enabled=False
+[Hydra] grad_clip: enable=False max_norm=1.0 norm_type=2
+[Hydra-eval] {}
+[Hydra-eval] early_enabled=False, stage_table={}
+[Hydra-model] model_cfg={'_target_': 'utils.model.unet.Unet', 'in_chans': 1, 'out_chans': 1, 'chans': 32, 'num_pool_layers': 4, 'drop_prob': 0.0}
+Error executing job with overrides: []
+Error locating target 'utils.common.loss_function.BCEDiceLoss', set env var HYDRA_FULL_ERROR=1 to see chained exception.
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

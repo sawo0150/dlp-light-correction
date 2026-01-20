@@ -10,35 +10,29 @@ defaults:
   # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)
   - model: dlp_unet_small
   - data: local_trainpack
-  - LossFunction: dlp_bce_dice
+  - LossFunction: BCEWithLogitsDice
 
   # 아래는 기존 hydra 뼈대 재사용용 (필요 없으면 점진적으로 제거)
   - optimizer: adamw
   - LRscheduler: CosineAnnealingLR
-  - training: base
   - early_stop: none
-  - evaluation: none
   - aug: none
 
   # DLP inverse에서는 기하학 변환(rotate/flip/crop) 기본 OFF 권장.
-  # maskDuplicate/maskAugment/collator/compressor/sampler는 MRI 전용이므로 우선 none/identity로 둠.
-  - maskDuplicate: none
-  - maskAugment: none
-  - collator: identity
-  - compressor: none
-  - sampler: identity
 
 # === 공통 학습 하이퍼파라미터 ===
 GPU_NUM: 0
-batch_size: 4
-val_batch_size: 4
+batch_size: 2
+val_batch_size: 2
+training_accum_steps: 4 # 🟢 추가: 1장씩 4번 모아서 업데이트 (실제 배치 4 효과)
+training_amp: true   # 🔴 False (또는 주석) -> true 로 변경
 num_epochs: 50
 warmup_epochs: 0
 
 lr: 1e-3
 report_interval: 7000
 seed: 430
-num_workers: 0
+num_workers: 8
 
 exp_name: dlp_inverse_thr2mask_baseline
 
@@ -51,7 +45,7 @@ image:
   binarize_target: true   # mask는 최종적으로 binary라면 true (필요시 gray도 가능)
 
 wandb:
-  project: final_train_Debugging
+  project: dlp_inverse_Debugging
   entity: swpants05-seoul-national-university        # W&B 팀/계정
   use_wandb: true
   max_vis_per_cat: 5        # epoch 마다 카테고리별 이미지 수 (0 → 안 올림)
@@ -59,6 +53,15 @@ wandb:
   use_visLogging: true
   use_receptiveField: false
 
+# ✅ [Log Path Fix] Hydra 로그가 현재 폴더에 쌓이지 않도록 경로 지정
+hydra:
+  run:
+    # 결과가 저장되는 result 폴더 내부로 이동
+    dir: ../result/${exp_name}/hydra_logs/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  sweep:
+    dir: ../result/${exp_name}/hydra_sweep/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  job:
+    chdir: false  # 코드가 실행되는 작업 디렉토리를 변경하지 않음 (경로 에러 방지)
 
 # ✅ (선택) 실험 태그/필터: TrainPack manifest 기반 필터링 옵션
 filters:

@@ -1,0 +1,5 @@
+# configs/LossFunction/BCEWithLogitsDice.yaml
+_target_: utils.common.loss_function.BCEWithLogitsDiceLoss
+w_bce: 1.0
+w_dice: 1.0
+pos_weight: null   # 필요하면 3.0 같은 값

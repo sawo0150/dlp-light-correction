@@ -1,0 +1,54 @@
+[Task] inverse
+Current cuda device:  0
+[Hydra] training: accum_steps=1 checkpointing=False amp_enabled=False
+[Hydra] grad_clip: enable=False max_norm=1.0 norm_type=2
+[Hydra-eval] {}
+[Hydra-eval] early_enabled=False, stage_table={}
+[Hydra-model] model_cfg={'_target_': 'utils.model.unet.Unet', 'in_chans': 1, 'out_chans': 1, 'chans': 32, 'num_pool_layers': 4, 'drop_prob': 0.0}
+[Hydra] loss_func ▶ BCEWithLogitsDiceLoss(
+  (dice): DiceLoss()
+  (bce): BCEWithLogitsLoss()
+)
+[Hydra] optimizer ▶ AdamW
+[Dataset] Parsing metadata for 107975 subjects (Smart Fast Mode)...
+[Dataset] Auto-detected filename format: *.png
+Building Dataset: 100%|██████████████| 107975/107975 [00:01<00:00, 61506.49it/s]
+[Info] Skip calculating exact effective_steps to save time.
+[Hydra] Scheduler ▶ <torch.optim.lr_scheduler.CosineAnnealingLR object at 0x75e17156fd30>
+[Resume] None
+[Data] trainpack_root: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280
+[Data] manifest_csv  : /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/manifest.csv
+[Hydra-eval] {}
+[Hydra-eval] lb_enable=False, lb_every=999999
+[Dataset] Parsing metadata for 5999 subjects (Smart Fast Mode)...
+[Dataset] Auto-detected filename format: *.png
+Building Dataset: 100%|█████████████████| 5999/5999 [00:00<00:00, 109105.23it/s]
+Epoch # 0 ............... dlp_inverse_thr2mask_baseline ...............
+[Dataset] Parsing metadata for 107975 subjects (Smart Fast Mode)...
+[Dataset] Auto-detected filename format: *.png
+Building Dataset: 100%|██████████████| 107975/107975 [00:01<00:00, 57342.93it/s]
+Error executing job with overrides: []                                
+Traceback (most recent call last):
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/main.py", line 129, in main
+    train(args)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/learning/train_part.py", line 413, in train
+    train_loss, train_time = train_epoch(
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/learning/train_part.py", line 84, in train_epoch
+    for iter, data in pbar:
+  File "/home/swpants05/.local/lib/python3.10/site-packages/tqdm/std.py", line 1181, in __iter__
+    for obj in iterable:
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 631, in __next__
+    data = self._next_data()
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 675, in _next_data
+    data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 51, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 51, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/data/load_data.py", line 315, in __getitem__
+    x_u8 = _read_gray_u8(x_path)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/data/load_data.py", line 35, in _read_gray_u8
+    raise FileNotFoundError(f"failed to read image: {path}")
+FileNotFoundError: failed to read image: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/thr/gray/random/B5_imagenet__gray__sample_04328__A2__stress_quant_partial_mask_gray__R0.png
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

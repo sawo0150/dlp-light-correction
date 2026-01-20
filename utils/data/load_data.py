@@ -6,6 +6,7 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from tqdm import tqdm  # ✅ [추가]
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -115,6 +116,9 @@ class TrainPackManifestDataset(Dataset):
         self.seed = int(seed)
         self.shuffle_thr = bool(shuffle_thr)
 
+        # index_filename 인자는 create_data_loaders에서 넘어오거나 기본값 사용
+        index_filename = "thr_file_index.json"
+
         # inverse settings
         inv = (task_cfg or {}).get("inverse", {})
         self.input_source = inv.get("input_source", "thr_random")  # thr_random|thr_fixed|ld_1280_aligned
@@ -126,6 +130,17 @@ class TrainPackManifestDataset(Dataset):
         # image settings
         self.normalize = image_cfg.get("normalize", "0_1")
         self.binarize_target = bool(image_cfg.get("binarize_target", True))
+
+        # ✅ [최적화] JSON 인덱스 로드 (엄청 빠름)
+        self.file_index = {}
+        if self.input_source == "thr_random":
+            index_path = self.root / index_filename
+            if index_path.exists():
+                print(f"[Dataset] Loading file index from {index_path}...")
+                with open(index_path, "r") as f:
+                    self.file_index = json.load(f)
+            else:
+                print(f"[Dataset] WARN: Index file {index_path} not found. Fallback to slow scan.")
 
         # load manifest
         rows = self._read_manifest_rows()
@@ -146,9 +161,6 @@ class TrainPackManifestDataset(Dataset):
         self.items: List[Dict] = self._build_items(rows)
         if len(self.items) == 0:
             raise RuntimeError("No samples after filtering. Check split/modes/filters.")
-
-        # per-epoch rng base
-        self._rng = random.Random(self.seed)
 
     def _read_manifest_rows(self) -> List[TrainPackRow]:
         out: List[TrainPackRow] = []
@@ -176,16 +188,34 @@ class TrainPackManifestDataset(Dataset):
             return [r for r in rows if r.sample_key in ids]
         # default: manifest split column
         return [r for r in rows if r.split == self.split]
-
+    
     def _list_thr_random_files(self, thr_dir_rel: str, sample_key: str) -> List[Path]:
+        """
+        Manifest의 폴더 경로(thr_dir_rel)를 읽어 캐싱(self._dir_cache)한 뒤,
+        파일명이 '{sample_key}__R'로 시작하는 모든 파일을 찾아 리스트로 반환합니다.
+        예: '...sample_04302_mask__R01__80.png' 같은 복잡한 접미사도 찾아냅니다.
+        """
         if not thr_dir_rel:
            return []
-        d = self.root / thr_dir_rel
-        if not d.exists():
-            return []
-        # naming: {sample_key}__Rxx__thr.png (extract script)
-        files = sorted(d.glob(f"{sample_key}__R*.png"))
-        return files
+        
+        full_dir_path = self.root / thr_dir_rel
+        dir_str = str(full_dir_path)
+
+        # 1. 캐시 확인 (없으면 폴더 읽기)
+        if dir_str not in self._dir_cache:
+            if not full_dir_path.exists():
+                self._dir_cache[dir_str] = []
+            else:
+                self._dir_cache[dir_str] = os.listdir(full_dir_path)
+        
+        # 2. 메모리 상에서 필터링 (접두사 매칭)
+        prefix = f"{sample_key}__R"
+        
+        found = [full_dir_path / f for f in self._dir_cache[dir_str] 
+                 if f.startswith(prefix) and f.endswith(".png")]
+        
+        # 파일명 정렬 (R00, R01 순서 보장)
+        return sorted(found)
 
     def _pick_thr_fixed_file(self, thr_fixed_map_json: str, sample_key: str) -> Optional[Path]:
         try:
@@ -206,36 +236,51 @@ class TrainPackManifestDataset(Dataset):
 
     def _build_items(self, rows: List[TrainPackRow]) -> List[Dict]:
         items: List[Dict] = []
-        for r in rows:
-            target = self.root / r.mask_1280_path
-            if not target.exists():
-                continue
 
+        print(f"[Dataset] Parsing metadata for {len(rows)} subjects (Indexed Lookup)...")
+       
+        for r in tqdm(rows, desc="Building Dataset", ncols=80):
+            target = self.root / r.mask_1280_path
+            
+            # (1) ld_1280 모드
             if self.input_source == "ld_1280_aligned":
                 x = self.root / r.ld_1280_aligned_path
-                if x.exists():
-                    items.append({"row": r, "x_path": x, "y_path": target, "thr_id": ""})
+                items.append({"row": r, "x_path": x, "y_path": target, "thr_id": ""})
                 continue
 
+            # (2) thr_fixed 모드
             if self.input_source == "thr_fixed":
                 x = self._pick_thr_fixed_file(r.thr_fixed_map_json, r.sample_key)
-                if x is not None and x.exists():
+                if x is not None:
                     items.append({"row": r, "x_path": x, "y_path": target, "thr_id": "fixed"})
                 continue
 
-            # default: thr_random
-            thr_files = self._list_thr_random_files(r.thr_random_dir, r.sample_key)
+            # (3) thr_random 모드 (Default)
+            count = r.thr_random_count
+            if count <= 0:
+                continue
+
+            # 🌟 [최적화] 폴더 스캔 대신 미리 로드한 JSON 인덱스 사용 (O(1))
+            raw_paths = self.file_index.get(r.sample_key)
+            
+            if not raw_paths:
+                continue
+                
+            # JSON 경로들은 root 기준 상대경로이므로 합쳐줌
+            thr_files = [self.root / p for p in raw_paths]
+
             if not thr_files:
                 continue
+
             if self.thr_random_policy == "random_one":
-                # store the list; choose at __getitem__
                 items.append({"row": r, "x_paths": thr_files, "y_path": target})
             else:
                 # expand_all
-                for p in thr_files:
-                    items.append({"row": r, "x_path": p, "y_path": target, "thr_id": p.stem})
+                for i, p in enumerate(thr_files):
+                    items.append({"row": r, "x_path": p, "y_path": target, "thr_id": f"R{i}"})
+                    
         return items
-
+    
     def __len__(self) -> int:
         return len(self.items)
 

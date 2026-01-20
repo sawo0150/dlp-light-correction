@@ -1,0 +1,125 @@
+[Task] inverse
+Current cuda device:  0
+[Hydra] training: accum_steps=4 checkpointing=False amp_enabled=False
+[Hydra] grad_clip: enable=False max_norm=1.0 norm_type=2
+[Hydra-eval] {}
+[Hydra-eval] early_enabled=False, stage_table={}
+[Hydra-model] model_cfg={'_target_': 'utils.model.unet.Unet', 'in_chans': 1, 'out_chans': 1, 'chans': 32, 'num_pool_layers': 4, 'drop_prob': 0.0}
+[Hydra] loss_func ▶ BCEWithLogitsDiceLoss(
+  (dice): DiceLoss()
+  (bce): BCEWithLogitsLoss()
+)
+[Hydra] optimizer ▶ AdamW
+[Dataset] Loading file index from /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/thr_file_index.json...
+[Dataset] Parsing metadata for 107975 subjects (Indexed Lookup)...
+Building Dataset: 100%|██████████████| 107975/107975 [00:01<00:00, 63219.91it/s]
+[Info] Skip calculating exact effective_steps to save time.
+[Hydra] Scheduler ▶ <torch.optim.lr_scheduler.CosineAnnealingLR object at 0x77bd4dfc1f00>
+[Resume] None
+[Data] trainpack_root: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280
+[Data] manifest_csv  : /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/manifest.csv
+[Hydra-eval] {}
+[Hydra-eval] lb_enable=False, lb_every=999999
+[Dataset] Loading file index from /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/thr_file_index.json...
+[Dataset] Parsing metadata for 5999 subjects (Indexed Lookup)...
+Building Dataset: 100%|█████████████████| 5999/5999 [00:00<00:00, 107257.44it/s]
+Epoch # 0 ............... dlp_inverse_thr2mask_baseline ...............
+[Dataset] Loading file index from /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/thr_file_index.json...
+[Dataset] Parsing metadata for 107975 subjects (Indexed Lookup)...
+Building Dataset: 100%|██████████████| 107975/107975 [00:01<00:00, 72893.13it/s]
+Traceback (most recent call last):                                    
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/main.py", line 136, in <module>
+    main()
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/main.py", line 94, in decorated_main
+    _run_hydra(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+    _run_app(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+    run_and_report(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+    lambda: hydra.run(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/hydra.py", line 119, in run
+    ret = run_job(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/core/utils.py", line 186, in run_job
+    ret.return_value = task_function(task_cfg)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/main.py", line 129, in main
+    train(args)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/learning/train_part.py", line 413, in train
+    train_loss, train_time = train_epoch(
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/learning/train_part.py", line 91, in train_epoch
+    logits = model(x)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/model/unet.py", line 89, in forward
+    output = transpose_conv(output)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/model/unet.py", line 190, in forward
+    return self.layers(image)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/container.py", line 217, in forward
+    input = module(input)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 952, in forward
+    return F.conv_transpose2d(
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/main.py", line 136, in <module>
+    main()
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/main.py", line 94, in decorated_main
+    _run_hydra(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+    _run_app(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+    run_and_report(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+    lambda: hydra.run(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/_internal/hydra.py", line 119, in run
+    ret = run_job(
+  File "/home/swpants05/.local/lib/python3.10/site-packages/hydra/core/utils.py", line 186, in run_job
+    ret.return_value = task_function(task_cfg)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/main.py", line 129, in main
+    train(args)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/learning/train_part.py", line 413, in train
+    train_loss, train_time = train_epoch(
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/learning/train_part.py", line 91, in train_epoch
+    logits = model(x)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/model/unet.py", line 89, in forward
+    output = transpose_conv(output)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/Desktop/26-1_UROP/dlp-light-correction/utils/model/unet.py", line 190, in forward
+    return self.layers(image)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/container.py", line 217, in forward
+    input = module(input)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1532, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1541, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/swpants05/.local/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 952, in forward
+    return F.conv_transpose2d(
+KeyboardInterrupt

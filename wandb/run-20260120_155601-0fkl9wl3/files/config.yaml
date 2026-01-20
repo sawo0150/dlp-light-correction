@@ -1,0 +1,188 @@
+_wandb:
+    value:
+        cli_version: 0.21.0
+        e:
+            fqzhwa0uo4icgdljiocx4m69zhw6cc7q:
+                codePath: main.py
+                codePathLocal: main.py
+                cpu_count: 8
+                cpu_count_logical: 16
+                cudaVersion: "12.4"
+                disk:
+                    /:
+                        total: "982818799616"
+                        used: "680869916672"
+                email: swpants05@snu.ac.kr
+                executable: /home/swpants05/miniconda3/envs/dlp/bin/python
+                git:
+                    commit: 1fa03e4d0b1d74d708e14a3a84afe81d3ad5e626
+                    remote: git@github.com:sawo0150/dlp-light-correction.git
+                gpu: NVIDIA GeForce RTX 4070 SUPER
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 7168
+                      memoryTotal: "12878610432"
+                      name: NVIDIA GeForce RTX 4070 SUPER
+                      uuid: GPU-15ce3daf-aa6f-fd1c-9624-e83615081790
+                host: swpants05-desktop
+                memory:
+                    total: "67340554240"
+                os: Linux-6.8.0-65-generic-x86_64-with-glibc2.35
+                program: /home/swpants05/Desktop/26-1_UROP/dlp-light-correction/main.py
+                python: CPython 3.10.19
+                root: /home/swpants05/Desktop/26-1_UROP/dlp-light-correction
+                startedAt: "2026-01-20T06:56:01.553355Z"
+                writerId: fqzhwa0uo4icgdljiocx4m69zhw6cc7q
+        m: []
+        python_version: 3.10.19
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 50
+                - 105
+            "2":
+                - 1
+                - 11
+                - 49
+                - 50
+                - 105
+            "3":
+                - 13
+                - 16
+            "4": 3.10.19
+            "5": 0.21.0
+            "6": 4.44.2
+            "12": 0.21.0
+            "13": linux-x86_64
+GPU_NUM:
+    value: 0
+LRscheduler:
+    value:
+        _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+        T_max: 50
+        eta_min: 1e-06
+LossFunction:
+    value:
+        _target_: utils.common.loss_function.BCEWithLogitsDiceLoss
+        pos_weight: null
+        w_bce: 1
+        w_dice: 1
+aug:
+    value:
+        _target_: utils.augmentations.mraugmenter.MRAugmenter
+        aug_delay: 0
+        aug_exp_decay: 6
+        aug_on: false
+        aug_schedule_mode: constant
+        aug_schedule_type: ramp
+        aug_strength: 0.9
+        max_epochs: 50
+        max_rotation_angle: 15
+        max_shear_angle: 10
+        scale_range:
+            - 0.85
+            - 1.15
+        shift_extent: 5
+        val_loss_grad_plateau: -0.001
+        val_loss_grad_start: -0.05
+        val_loss_window_size: 5
+        weight_dict:
+            fliph: 0.5
+            flipv: 0.5
+            rotate: 1
+            scale: 1
+            shear: 0.5
+            shift: 1
+batch_size:
+    value: 2
+data:
+    value:
+        PROJECT_ROOT: /home/swpants05/Desktop/26-1_UROP
+        manifest_csv: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/manifest.csv
+        modes:
+            - binary
+            - gray
+        split: train
+        split_source: manifest
+        splits_dir: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280/splits
+        trainpack_root: /home/swpants05/Desktop/trainpacks/TrainPack_allinone_COPY_1280
+early_stop:
+    value:
+        enable: false
+        stages:
+            - epoch: 10
+              ssim: 0.9
+            - epoch: 20
+              ssim: 0.95
+            - epoch: 25
+              ssim: 0.96
+exp_name:
+    value: dlp_inverse_thr2mask_baseline
+filters:
+    value:
+        dataset_allow: []
+        modes:
+            - binary
+            - gray
+        qc_filter: ""
+image:
+    value:
+        binarize_target: true
+        in_channels: 1
+        normalize: "0_1"
+        out_channels: 1
+        size: 1280
+lr:
+    value: 0.001
+model:
+    value:
+        _target_: utils.model.unet.Unet
+        chans: 32
+        drop_prob: 0
+        in_chans: 1
+        num_pool_layers: 4
+        out_chans: 1
+num_epochs:
+    value: 50
+num_workers:
+    value: 0
+optimizer:
+    value:
+        _target_: torch.optim.AdamW
+        betas:
+            - 0.9
+            - 0.999
+        eps: 1e-08
+        lr: 0.001
+        weight_decay: 0.01
+report_interval:
+    value: 7000
+seed:
+    value: 430
+task:
+    value:
+        inverse:
+            input_source: thr_random
+            mode_condition: from_manifest
+            target_key: mask_1280
+            thr_fixed_values: []
+            thr_random_policy: expand_all
+            thr_stack: false
+        name: inverse
+training_accum_steps:
+    value: 4
+val_batch_size:
+    value: 2
+wandb:
+    value:
+        entity: swpants05-seoul-national-university
+        max_vis_per_cat: 5
+        project: dlp_inverse_Debugging
+        use_receptiveField: false
+        use_visLogging: true
+        use_wandb: true
+warmup_epochs:
+    value: 0

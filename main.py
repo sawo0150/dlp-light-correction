@@ -10,18 +10,16 @@ OmegaConf.register_new_resolver(
     "calc",
     lambda expr: eval(expr, {"__builtins__": {}, "math": math, "operator": operator.__dict__})
 )
-
-import hydra, wandb, torch, sys, os
+import hydra
+import torch
+import sys
+import wandb
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
 # repo 내부 모듈 임포트 경로 확보 (train.py 방식과 동일) ────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
-for extra in ["utils/model", "utils/common"]:
-    path = PROJECT_ROOT / extra
-    if str(path) not in sys.path:
-        sys.path.insert(1, str(path))
 
 from utils.learning.train_part import train      # 기존 학습 루프
 from utils.common.utils import seed_fix          # seed 고정 함수
@@ -41,19 +39,10 @@ def _flatten_cfg_to_args(cfg: DictConfig) -> SimpleNamespace:
         for k, v in node.items():
             new_key = f"{prefix}_{k}" if prefix else k
 
-            PRESERVE = {
-                        "task",
-                        "model", "data", "LRscheduler", "LossFunction",
-                        "optimizer", "compressor", "collator", "sampler",
-                        "evaluation", "early_stop", "maskDuplicate","maskAugment"
-                        ,"aug", "centerCropPadding", "deepspeed",
-                        "image", "filters",
-                        }
-            # ─ Gradient Accum Scheduler dict 보존 (training.grad_accum_scheduler) ─
-            if k == "grad_accum_scheduler" and isinstance(v, Mapping):
-                setattr(args, new_key, v)   # args.training_grad_accum_scheduler 로 접근 가능
-                recurse(new_key, v)
-                continue
+            # ✅ DLP 최소 구성: train.yaml에 남긴 것만 preserve
+            PRESERVE = {"task", "model", "data", "LossFunction", "optimizer", 
+                        "LRscheduler", "image", "filters", "wandb"}
+ 
 
             # (1) 보존용 속성 먼저 세팅
             if prefix == "" and k in PRESERVE and isinstance(v, Mapping):
@@ -68,12 +57,25 @@ def _flatten_cfg_to_args(cfg: DictConfig) -> SimpleNamespace:
 
     recurse("", container)
 
-    # 추가로 main.py 레거시 필드도 맞춰줌
-    args.GPU_NUM         = container["GPU_NUM"]
-    args.use_wandb       = container["wandb"]["use_wandb"]
-    args.max_vis_per_cat = container["wandb"]["max_vis_per_cat"]
-    args.deepspeed = container["training"]["deepspeed"]
+    # ✅ 최소 필드만 alias로 세팅
+    args.GPU_NUM = container.get("GPU_NUM", 0)
+    args.use_wandb = container.get("wandb", {}).get("use_wandb", False)
+    args.max_vis_per_cat = container.get("wandb", {}).get("max_vis_per_cat", 0)
 
+    # ─────────────────────────────────────────────────────────────
+    # [FIX] 변수명 매핑 추가
+    # main.py는 'trainpack_root'로 만들었지만, load_data.py는 'data_trainpack_root'를 찾음
+    # ─────────────────────────────────────────────────────────────
+    if hasattr(args, "trainpack_root") and not hasattr(args, "data_trainpack_root"):
+        args.data_trainpack_root = args.trainpack_root
+    
+    if hasattr(args, "manifest_csv") and not hasattr(args, "data_manifest_csv"):
+        args.data_manifest_csv = args.manifest_csv
+        
+    if hasattr(args, "splits_dir") and not hasattr(args, "data_splits_dir"):
+        args.data_splits_dir = args.splits_dir
+        
+    # ─────────────────────────────────────────────────────────────
     # ✅ DLP TrainPack 경로도 Path로 변환 (Dataset에서 join할 때 편하게)
     if hasattr(args, "data_trainpack_root"):
         args.data_trainpack_root = Path(args.data_trainpack_root)
@@ -82,18 +84,16 @@ def _flatten_cfg_to_args(cfg: DictConfig) -> SimpleNamespace:
     if hasattr(args, "data_splits_dir"):
         args.data_splits_dir = Path(args.data_splits_dir)
 
-    # 5) 결과 경로 세팅 (train.py 로직 반영) :contentReference[oaicite:1]{index=1}
-    result_dir = Path(cfg.data.PROJECT_ROOT) / "result" / args.exp_name
+    # ✅ 결과 경로 세팅 (data.PROJECT_ROOT가 없으면 현재 작업 디렉토리 사용)
+    project_root = Path(getattr(cfg, "data", {}).get("PROJECT_ROOT", Path.cwd()))
+    result_dir = project_root / "result" / args.exp_name
+
     args.exp_dir = result_dir / "checkpoints"
     args.val_dir = result_dir / "reconstructions_val"
     args.main_dir = result_dir / Path(__file__).name
     args.val_loss_dir = result_dir
     for p in [args.exp_dir, args.val_dir]:
         p.mkdir(parents=True, exist_ok=True)
-
-    # ─ domain_filter(옵션) 전달
-    if "data" in cfg and "domain_filter" in cfg["data"]:
-        args.domain_filter = cfg.data.domain_filter
 
     return args
 
@@ -107,25 +107,29 @@ def main(cfg: DictConfig):
     args = _flatten_cfg_to_args(cfg)
 
     # ── 3. W&B 초기화 (조건부) -------------------------------------------------
-    if cfg.wandb.use_wandb:
+    if args.use_wandb and wandb is not None:
+        wandb_cfg = getattr(cfg, "wandb", None)
+        
+        # ✅ [Log Path Fix] wandb 로그가 result 폴더 안에 쌓이도록 설정
+        wandb_dir = args.val_loss_dir / "wandb_logs"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        
         wandb.init(
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
+            project=wandb_cfg.project,
+            entity=wandb_cfg.entity,
             name=args.exp_name,
             config=OmegaConf.to_container(cfg, resolve=True),
         )
- 
  
     # ── 4. 학습 (task 라우팅) -------------------------------------------------
     task_name = getattr(cfg, "task", {}).get("name", "train")
     print(f"[Task] {task_name}")
 
-    # 지금은 train_part.py를 DLP용으로 바꾸기 전이므로 train(args)로 진입만 유지.
-    # 이후: if task_name == "inverse": train_inverse(args) 같은 분기 추천.
+    # 현재는 train_part.train 하나로 진입
     train(args)
 
     # ── 5. 마무리 -------------------------------------------------------------
-    if cfg.wandb.use_wandb:
+    if args.use_wandb and wandb is not None:
         wandb.finish()
 
 if __name__ == "__main__":
