@@ -34,8 +34,8 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_  
 
 from utils.data.load_data import create_data_loaders
-from utils.logging.metric_accumulator import MetricAccumulator
-from utils.logging.vis_logger import log_epoch_samples
+from utils.logging.wandb_logger import WandbLogger
+
 
 # (선택) metric logger는 간단히 숫자만 찍도록 축소
 
@@ -54,13 +54,9 @@ def _dice_iou_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float
  
 def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
                 loss_fn,
-                scaler, amp_enabled, accum_steps):  # [수정] use_deepspeed 제거
-    # print(sum(p.numel() for p in model.parameters()))
-    # from utils.model.feature_varnet.modules import DLKAConvBlock
-    # for n,m in model.named_modules():
-    #     if isinstance(m, DLKAConvBlock): print("DLKA at", n)
-    # for n, p in model.named_parameters(): print(n, p.numel())
-    # torch.autograd.set_detect_anomaly(True)
+                scaler, amp_enabled, accum_steps,
+                logger: WandbLogger,
+                global_iter_start: int = 0):
 
     model.train()
     # reset peak memory counter at the start of each epoch
@@ -76,7 +72,7 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
 
     pbar = tqdm(enumerate(data_loader),
                 total=len_loader,
-                ncols=70,
+                dynamic_ncols=True,   # ✅ 터미널 폭에 맞춰 자동 확장
                 leave=False,
                 desc=f"Epoch[{epoch:2d}/{args.num_epochs}]/")
 
@@ -148,7 +144,26 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
 
         total_loss += float(loss.detach().item()) * accum_steps
         dice, iou = _dice_iou_from_logits(logits.detach(), y.detach())
-        pbar.set_postfix(loss=f"{(total_loss/(iter+1)):.4g}", dice=f"{dice:.3f}", iou=f"{iou:.3f}")
+
+        # ✅ postfix를 문자열로 넣으면 잘림이 덜하고, 출력 제어가 쉬움
+        avg_loss = total_loss / (iter + 1)
+        pbar.set_postfix_str(f"loss {avg_loss:.4g} | D {dice:.3f} | I {iou:.3f}")
+
+        # ✅ Train metric: iter 단위 로깅 (N iters마다)
+        if logger.enabled:
+            wb_cfg = getattr(args, "wandb", {}) if hasattr(args, "wandb") else {}
+            log_every = int(wb_cfg.get("log_every_n_iters", 0) or 0) if isinstance(wb_cfg, dict) else 0
+            if log_every and (iter > 0) and (iter % log_every == 0):
+                lr = optimizer.param_groups[0]["lr"] if optimizer else 0.0
+                logger.log_train_iter(
+                    step=global_iter_start + iter,
+                    epoch=epoch,
+                    it=iter,
+                    loss=float(loss.detach().item() * accum_steps),
+                    dice=float(dice),
+                    iou=float(iou),
+                    lr=float(lr),
+                )
 
         del logits, loss
         torch.cuda.empty_cache()
@@ -168,7 +183,7 @@ def validate(args, model, data_loader, epoch, loss_fn):
     len_loader = len(data_loader)                 # ← 전체 길이
     pbar = tqdm(enumerate(data_loader),           # ← tqdm 래퍼
                 total=len_loader,
-                ncols=70,
+                dynamic_ncols=True,   # ✅ 터미널 폭에 맞춰 자동 확장
                 leave=False,
                 desc=f"Val  [{epoch:2d}/{args.num_epochs}]")
     
@@ -186,7 +201,11 @@ def validate(args, model, data_loader, epoch, loss_fn):
             total_dice += float(dice)
             total_iou  += float(iou)
             n_batches += 1
-            pbar.set_postfix(loss=f"{(total_loss/n_batches):.4g}", dice=f"{(total_dice/n_batches):.3f}", iou=f"{(total_iou/n_batches):.3f}")
+
+            avg_loss = total_loss / n_batches
+            avg_dice = total_dice / n_batches
+            avg_iou  = total_iou / n_batches
+            pbar.set_postfix_str(f"loss {avg_loss:.4g} | D {avg_dice:.3f} | I {avg_iou:.3f}")
 
         torch.cuda.empty_cache()
 
@@ -217,6 +236,9 @@ def train(args):
     print('Current cuda device: ', torch.cuda.current_device())
     # DLP에서는 maskDuplicate/maskAugment/collator/compressor/sampler 등 MRI 전용 기능 제거
     dup_mul = 1
+
+    # ✅ Logger (W&B)
+    logger = WandbLogger(args)
 
     # ▸ 0. 옵션 파싱 (기본값 유지)
     # ───────── Gradient Accumulation 기본값 및 스케줄러 설정 ─────────
@@ -389,6 +411,8 @@ def train(args):
     # train_loader = create_data_loaders(data_path = args.data_path_train, args = args, shuffle=True) # 매 에폭마다 생성 예정
     val_loader = create_data_loaders(args=args, split="val", shuffle=False, is_train=False)
     
+    global_iter = 0
+
     # ▲ Resume 시 기존 val_loss_log를 불러와 이어서 기록
     val_loss_log_file = os.path.join(args.val_loss_dir, "val_loss_log.npy")
     if getattr(args, 'resume_checkpoint', None) and os.path.exists(val_loss_log_file):
@@ -412,8 +436,12 @@ def train(args):
 
         train_loss, train_time = train_epoch(
             args, epoch, model, train_loader, optimizer, scheduler,
-            loss_fn, scaler, amp_enabled, accum_steps
-        )
+            loss_fn, scaler, amp_enabled, accum_steps,
+            logger=logger,
+            global_iter_start=global_iter
+         )
+        global_iter += len(train_loader)    # ✅ 이 시점의 global_iter가 "epoch 끝 step"
+        
         val_loss, val_dice, val_iou, val_time = validate(args, model, val_loader, epoch, loss_fn)
 
         # ✨ val_loss 기록 (스케줄러 및 체크포인트용)
@@ -459,22 +487,33 @@ def train(args):
             else:
                 scheduler.step()
 
-        # ---------------- W&B epoch log (간단) ----------------
-        if getattr(args, "use_wandb", False) and wandb:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "train/loss": float(train_loss),
-                    "val/loss": float(val_loss),
-                    "val/dice": float(val_dice),
-                    "val/iou": float(val_iou),
-                    "lr": optimizer.param_groups[0]["lr"] if optimizer else 0.0,
-                },
-                step=epoch*dup_mul
+        # ✅ Val/Test metric: epoch 단위 로깅
+        if logger.enabled:
+            lr = optimizer.param_groups[0]["lr"] if optimizer else 0.0
+            logger.log_epoch_metrics(
+                epoch=epoch,
+                train_loss=float(train_loss),
+                val_loss=float(val_loss),
+                val_dice=float(val_dice),
+                val_iou=float(val_iou),
+                lr=float(lr),
+                step=global_iter,   # ✅ step은 global_iter로 (단조 증가 보장)
             )
+
+        # ✅ Epoch 이미지 로깅 (train/val 선택)
+        if logger.enabled:
+            wb_cfg = getattr(args, "wandb", {}) if hasattr(args, "wandb") else {}
+            split_name = str(wb_cfg.get("log_images_split", "val")).lower() if isinstance(wb_cfg, dict) else "val"
+            if split_name == "train":
+                logger.log_epoch_images(model=model, loader=train_loader, epoch=epoch, split_name="train", device=device, step=global_iter)
+            else:
+                logger.log_epoch_images(model=model, loader=val_loader, epoch=epoch, split_name="val", device=device, step=global_iter)
+
+        # best 모델 저장은 기존 로직 유지 (wandb artifact는 main/train에서 선택적으로 추가 가능)
+        if getattr(args, "use_wandb", False) and (wandb is not None) and (getattr(wandb, "run", None) is not None):
             if is_new_best:
                 wandb.save(str(args.exp_dir / "best_model.pt"))
-                                
+                               
         print(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] '
             f'TrainLoss = {train_loss:.4g} ValLoss = {val_loss:.4g} '
