@@ -1,0 +1,15 @@
+# configs/model/band_unet_small.yaml
+_target_: utils.model.unet.BandUnet
+
+in_chans: 1
+out_chans: 1
+
+band_width: 11
+fixed_logit_val: 20.0
+
+# 아래는 내부 Unet kwargs로 들어감
+chans: 32
+num_pool_layers: 4
+drop_prob: 0.0
+norm: group
+num_groups: 8

@@ -69,6 +69,9 @@ def create_data_loaders(args, split: str, shuffle: bool, is_train: bool) -> Data
             require_flags["has_inv_fixed"] = 1
         elif input_source == "ld_1280_aligned":
             require_flags["has_fwd"] = 1
+        elif input_source == "mask_target":
+            # ✅ target mask만 있으면 되므로 require_flags 강제 없음
+            pass
 
     if task_name.startswith("forward"):
         require_flags["has_fwd"] = 1

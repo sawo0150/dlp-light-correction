@@ -23,6 +23,7 @@ python main.py \
     exp_name=dlp_forward_mask2ld_baseline_v0 \
     image.binarize_target=false \
     training_accum_steps=4 \
+    num_epochs=4 \
     batch_size=2 \
     evaluation.benchmark.enable=false \
     evaluation.benchmark.proxy_checkpoint="none" \

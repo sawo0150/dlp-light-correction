@@ -352,11 +352,17 @@ def train(args):
     model_cfg = getattr(args, "model")
     model = instantiate(OmegaConf.create(model_cfg))
     model.to(device)
-    print(f"[Hydra-model] model_cfg={model_cfg}")
 
     loss_cfg = getattr(args, "LossFunction")
     loss_fn = instantiate(OmegaConf.create(loss_cfg)).to(device=device)
-    print(f"[Hydra] loss_func ▶ {loss_fn}")
+
+    # ✅ avoid gigantic repr (ProxyForwardModel / Unet dump)
+    msg = f"[Hydra] loss_func ▶ {loss_fn.__class__.__name__}"
+    # best-effort: print key hyperparams if present
+    for k in ("grid_size", "infer_size", "cure_thr_low", "cure_thr_high"):
+        if hasattr(loss_fn, k):
+            msg += f" | {k}={getattr(loss_fn, k)}"
+    print(msg)
 
     # ──────────────────────────────────────────────────────────────────────────
     # ✅ [FIX] Optimizer 초기화 (UnboundLocalError 해결)
@@ -487,6 +493,7 @@ def train(args):
         # 1.5. Post-process configs (robust parsing)
         inv_post: Dict[str, Any] = bench_cfg.get("inverse_post", {}) or {}
         curing_cfg: Dict[str, Any] = bench_cfg.get("curing", {}) or {}
+        mp_cfg: Dict[str, Any] = bench_cfg.get("mask_pixelize", {}) or {}
         fwd_post: Dict[str, Any] = bench_cfg.get("forward_post", {}) or {}
         fwd_apply_sigmoid = bool(fwd_post.get("apply_sigmoid", False))
 
@@ -496,6 +503,12 @@ def train(args):
 
         curing_thr        = float(curing_cfg.get("threshold", 0.5))
         curing_binarize   = bool(curing_cfg.get("binarize", True))
+
+        mp_enable   = bool(mp_cfg.get("enable", False))
+        mp_size     = int(mp_cfg.get("size", 160))
+        mp_down     = str(mp_cfg.get("downsample", "mean")).lower()
+        mp_up       = str(mp_cfg.get("upsample", "nearest")).lower()
+        mp_apply_to = str(mp_cfg.get("apply_to", "both")).lower()
 
         print(
             f"[Benchmark] inverse_post: apply_sigmoid={inv_apply_sigmoid}, "
@@ -524,6 +537,11 @@ def train(args):
             curing_binarize=curing_binarize,
             forward_binarize_input=fwd_binarize_input,
             forward_apply_sigmoid=fwd_apply_sigmoid,
+            mask_pixelize_enable=mp_enable,
+            mask_pixelize_size=mp_size,
+            mask_pixelize_downsample=mp_down,
+            mask_pixelize_upsample=mp_up,
+            mask_pixelize_apply_to=mp_apply_to,
         )
         bench_freq = int(bench_cfg.get("log_every_n_epochs", 1))
 
@@ -680,7 +698,22 @@ def train(args):
         torch.cuda.empty_cache()
         if early_enabled and current_epoch in stage_table:
             req = stage_table[current_epoch]
-            if val_dice < req:
-                print(f"[EarlyStop] Epoch {current_epoch}: "
-                    f"val_dice={val_dice:.4f} < target={req:.4f}. 학습 중단!")
-                break                     # for epoch 루프 탈출
+            # ✅ [BugFix] val_dice 변수는 이 파일에서 더 이상 사용하지 않음
+            # inverse: val_m1 = dice, forward: early stop은 val_loss 기준이 더 자연스러움
+            if task_name.startswith("inverse"):
+                cur_score = float(val_m1)   # dice
+                if cur_score < req:
+                    print(
+                        f"[EarlyStop] Epoch {current_epoch}: "
+                        f"val_dice={cur_score:.4f} < target={req:.4f}. 학습 중단!"
+                    )
+                    break
+            elif task_name.startswith("forward"):
+                # forward는 낮을수록 좋음 → req를 "최대 허용 loss"로 해석
+                cur_loss = float(val_loss)
+                if cur_loss > req:
+                    print(
+                        f"[EarlyStop] Epoch {current_epoch}: "
+                        f"val_loss={cur_loss:.4f} > target={req:.4f}. 학습 중단!"
+                    )
+                    break

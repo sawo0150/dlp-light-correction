@@ -188,3 +188,73 @@ class TransposeConvBlock(nn.Module):
             Output tensor of shape `(N, out_chans, H*2, W*2)`.
         """
         return self.layers(image)
+    
+# ==============================================================================
+# ✅ NEW: Band Constraint Wrapper for DLP Inverse
+# ==============================================================================
+class BandUnet(nn.Module):
+    """
+    Wrapper around Unet that enforces a 'Band Constraint'.
+    Only pixels within the edges of the input mask are allowed to change.
+    
+    Output:
+        Logits where:
+        - Band Area: Learned logits from U-Net
+        - Inner/Outer Area: Fixed large logits (approx +/- inf) based on input mask.
+    """
+    def __init__(
+        self,
+        in_chans: int,
+        out_chans: int,
+        band_width: int = 13,  # Kernel size for morphological ops
+        fixed_logit_val: float = 20.0, # Large value s.t. sigmoid(20) ~= 1.0, sigmoid(-20) ~= 0.0
+        **unet_kwargs
+    ):
+        super().__init__()
+        self.unet = Unet(in_chans=in_chans, out_chans=out_chans, **unet_kwargs)
+        self.band_width = band_width
+        self.fixed_logit_val = fixed_logit_val
+
+    def _get_band_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute band (edge) mask using morphological dilation - erosion.
+        mask: [B, 1, H, W] Binary (0 or 1)
+        """
+        # Padding to keep size same
+        padding = self.band_width // 2
+        
+        # Dilate: MaxPool
+        dilated = F.max_pool2d(mask, kernel_size=self.band_width, stride=1, padding=padding)
+        
+        # Erode: -MaxPool(-x)
+        eroded = -F.max_pool2d(-mask, kernel_size=self.band_width, stride=1, padding=padding)
+        
+        # Band = Dilated - Eroded
+        band = dilated - eroded
+        return band
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input Target Mask [B, 1, H, W], typically binary {0, 1}
+        Returns:
+            out_logits: [B, out_chans, H, W]
+        """
+        # 1. Inference U-Net (Corrected Mask Prediction)
+        #    Note: U-Net sees the Target Mask and predicts correction logits
+        unet_logits = self.unet(x)
+
+        # 2. Compute Band Mask (Where we allow changes)
+        #    Assume x is sufficiently binary or threshold it if needed.
+        with torch.no_grad():
+            band_mask = self._get_band_mask(x)
+            
+            # 3. Construct Fixed Logits (Constraint)
+            #    Where x=1 -> +20.0, Where x=0 -> -20.0
+            #    This forces non-band areas to stay strictly Target
+            fixed_logits = x * self.fixed_logit_val + (1 - x) * (-self.fixed_logit_val)
+
+        # 4. Combine: Band gets UNet, Non-Band gets Fixed
+        out_logits = unet_logits * band_mask + fixed_logits * (1 - band_mask)
+        
+        return out_logits

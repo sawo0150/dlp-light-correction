@@ -1,0 +1,14 @@
+# /configs/LossFunction/physics_informedL1.yaml
+
+_target_: utils.common.physics_loss.PhysicsInformedLoss
+
+forward_checkpoint: ${evaluation.benchmark.proxy_checkpoint}
+
+grid_size: 160
+infer_size: 640
+
+# intensity in [0,255]
+cure_thr_low: 50.0
+cure_thr_high: 80.0
+
+device: cuda

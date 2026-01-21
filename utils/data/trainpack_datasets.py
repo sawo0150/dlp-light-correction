@@ -31,7 +31,7 @@ class CommonImageConfig:
 class InverseThr2MaskDataset(Dataset):
     """
     inverse_1:
-      x: thr_random | thr_fixed | ld_1280_aligned
+      x: thr_random | thr_fixed | ld_1280_aligned | mask_target
       y: mask_{128|160|1280}
     """
     def __init__(
@@ -53,7 +53,7 @@ class InverseThr2MaskDataset(Dataset):
         self.rng = random.Random(int(seed))
 
         inv = (self.task_cfg.get("inverse") or {})
-        self.input_source = inv.get("input_source", "thr_random")              # thr_random|thr_fixed|ld_1280_aligned
+        self.input_source = inv.get("input_source", "thr_random")              # thr_random|thr_fixed|ld_1280_aligned|mask_target
         self.thr_random_policy = inv.get("thr_random_policy", "expand_all")   # expand_all|random_one
         self.thr_fixed_values = list(inv.get("thr_fixed_values", []) or [])
         self.target_key = (inv.get("target_key", "mask_1280") or "mask_1280")
@@ -81,6 +81,12 @@ class InverseThr2MaskDataset(Dataset):
         items: List[Dict] = []
         for r in self.rows:
             y_path = self._resolve_target_path(r)
+
+            # ✅ NEW: mask_target (use target mask as input x)
+            if self.input_source == "mask_target":
+                x_path = y_path
+                items.append({"row": r, "x_path": x_path, "y_path": y_path})
+                continue
 
             if self.input_source == "ld_1280_aligned":
                 x_path = self.root / r.ld_1280_aligned_path

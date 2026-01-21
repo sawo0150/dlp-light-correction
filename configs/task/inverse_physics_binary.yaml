@@ -1,0 +1,23 @@
+# configs/task/inverse_physics_binary.yaml
+# Physics Inverse: target mask -> corrected mask (band) -> frozen forward -> soft curing -> L1(target)
+# - x: target mask (mask_160)  ✅ (dataset 내부에서 input_source=mask_target로 처리)
+# - y: target mask (mask_160)  ✅ (loss에서 target으로 사용)
+
+name: inverse_physics_binary
+
+inverse:
+  # ✅ NEW: use target mask as model input (instead of thr_random)
+  input_source: "mask_target"   # ["mask_target", "thr_random", "thr_fixed", "ld_1280_aligned"]
+
+  # target policy
+  target_key: "mask_160"
+  preprocess:
+    out_size: 640
+
+  mode_condition: "from_manifest"
+
+  data:
+    modes: ["binary"]
+    split_source: "manifest"
+    dataset_allow: []
+    qc_filter: ""

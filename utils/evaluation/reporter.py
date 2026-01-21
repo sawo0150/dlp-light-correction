@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 
 from utils.evaluation.benchmark_dataset import BenchmarkDataset
 from utils.evaluation.proxy_forward import ProxyForwardModel
+import torch.nn.functional as F
 
 
 class BenchmarkReporter:
@@ -31,6 +32,12 @@ class BenchmarkReporter:
         # ✅ NEW: forward input policy align
         forward_binarize_input: bool = False,
         forward_apply_sigmoid: bool = False,
+        # ✅ NEW: mask pixelization (coarse grid constraint)
+        mask_pixelize_enable: bool = False,
+        mask_pixelize_size: int = 160,
+        mask_pixelize_downsample: str = "mean",   # "mean"(area/avg) | "nearest"
+        mask_pixelize_upsample: str = "nearest",  # "nearest" | "bilinear"
+        mask_pixelize_apply_to: str = "both",     # "both" | "naive" | "corr"
     ):
         self.inverse_model = inverse_model
         self.forward_model = forward_model
@@ -48,11 +55,51 @@ class BenchmarkReporter:
         self.fwd_binarize_input = bool(forward_binarize_input)
         self.fwd_apply_sigmoid = bool(forward_apply_sigmoid)
 
+        # pixelize configs
+        self.mp_enable = bool(mask_pixelize_enable)
+        self.mp_size = int(mask_pixelize_size)
+        self.mp_down = str(mask_pixelize_downsample).lower()
+        self.mp_up = str(mask_pixelize_upsample).lower()
+        self.mp_apply_to = str(mask_pixelize_apply_to).lower()
+
     def _postprocess_forward(self, out: torch.Tensor) -> torch.Tensor:
         # forward model output이 logits인 경우에만 sigmoid
         if self.fwd_apply_sigmoid:
             return torch.sigmoid(out)
         return out
+
+    def _pixelize_mask(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Enforce coarse pixel grid on a mask-like tensor at inference resolution.
+        Policy (requested):
+          - downsample: mean (area/avg)  ✅
+          - upsample: nearest           ✅
+
+        x: [B,1,H,W] (H=W=self.infer_size expected)
+        returns: [B,1,self.infer_size,self.infer_size]
+        """
+        if (not self.mp_enable) or (self.mp_size <= 0):
+            return x
+
+        # 1) downsample to (mp_size, mp_size)
+        if self.mp_down in ("mean", "area", "avg"):
+            # adaptive_avg_pool2d == mean over regions (robust even when not divisible)
+            x_small = F.adaptive_avg_pool2d(x, output_size=(self.mp_size, self.mp_size))
+        elif self.mp_down in ("nearest",):
+            x_small = F.interpolate(x, size=(self.mp_size, self.mp_size), mode="nearest")
+        else:
+            # safe fallback
+            x_small = F.adaptive_avg_pool2d(x, output_size=(self.mp_size, self.mp_size))
+
+        # 2) upsample back to infer_size
+        if self.mp_up in ("nearest",):
+            x_back = F.interpolate(x_small, size=(self.infer_size, self.infer_size), mode="nearest")
+        elif self.mp_up in ("bilinear", "linear"):
+            x_back = F.interpolate(x_small, size=(self.infer_size, self.infer_size), mode="bilinear", align_corners=False)
+        else:
+            x_back = F.interpolate(x_small, size=(self.infer_size, self.infer_size), mode="nearest")
+
+        return x_back
 
     def _apply_forward_input_policy(self, x: torch.Tensor) -> torch.Tensor:
         if self.fwd_binarize_input:
@@ -143,7 +190,11 @@ class BenchmarkReporter:
 
             with torch.no_grad():
                 # 2. Naive Path: T -> Forward -> P(T) -> (optional curing threshold)
-                Naive_in = self._apply_forward_input_policy(T_infer_t)
+                Naive_in = T_infer_t
+                if self.mp_enable and self.mp_apply_to in ("both", "naive"):
+                    Naive_in = self._pixelize_mask(Naive_in)
+                Naive_in = self._apply_forward_input_policy(Naive_in)
+
                 Naive_Print_infer = self.forward_model(Naive_in)
                 Naive_Print_infer = self._apply_curing(Naive_Print_infer)           
 
@@ -152,7 +203,10 @@ class BenchmarkReporter:
                 M_out = self._postprocess_inverse(M_logits)  # may be gray or binary
    
                 # 4. Corrected Print: M -> Forward -> P(M) -> (optional curing threshold)
-                Corr_in = self._apply_forward_input_policy(M_out)
+                Corr_in = M_out
+                if self.mp_enable and self.mp_apply_to in ("both", "corr"):
+                    Corr_in = self._pixelize_mask(Corr_in)
+                Corr_in = self._apply_forward_input_policy(Corr_in)
                 Corrected_Print_infer = self.forward_model(Corr_in)
                 Corrected_Print_infer = self._apply_curing(Corrected_Print_infer)
  

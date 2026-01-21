@@ -1,5 +1,5 @@
 #!/bin/bash
-# trainingScripts/run_inverse_binary.sh
+# trainingScripts/run_inverse_1_binary.sh
 # =================================================================
 # DLP Inverse Model Training (Binary Mode)
 # Task: Thresholded LD -> Binary Mask
@@ -13,12 +13,16 @@ export CUDA_VISIBLE_DEVICES=0
 
 python main.py \
     task=inverse_1_binary \
+    LossFunction=BCEWithLogitsL1Loss \
     exp_name=dlp_inverse_binary_baseline_v1 \
+    wandb.project=dlp_inverse_peoject \
     \
     image.binarize_target=true \
     \
+    num_epochs=10 \
     training_accum_steps=4 \
-    batch_size=1 \
+    batch_size=2 \
     \
     evaluation.benchmark.enable=true \
+    evaluation.benchmark.inverse_post.binarize=true \
     hydra.job.chdir=false

@@ -80,6 +80,10 @@ class ProxyForwardModel(nn.Module):
         self.model.eval()
         self.model.to(device)
 
+        # NOTE:
+        # - forward() 는 benchmark/평가용으로 no_grad 유지
+        # - 학습(loss)에서 gradient가 필요하면 forward_with_grad() 를 사용
+ 
     def _load_model(self, ckpt_path: str | Path) -> nn.Module:
         path = Path(ckpt_path)
         if not path.exists():
@@ -136,6 +140,15 @@ class ProxyForwardModel(nn.Module):
         """
         Args: mask [B, 1, H, W]
         Returns: light_dist [B, 1, H, W]
+        """
+        x = mask.to(self.device)
+        return self.model(x)
+    
+    def forward_with_grad(self, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Training-time differentiable forward pass.
+        - Keeps graph for gradient backprop to the input mask.
+        - Forward model parameters should be frozen (requires_grad=False) outside.
         """
         x = mask.to(self.device)
         return self.model(x)

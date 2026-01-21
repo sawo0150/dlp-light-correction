@@ -1,5 +1,5 @@
 #!/bin/bash
-# trainingScripts/run_inverse_gray.sh
+# trainingScripts/run_inverse_1_gray.sh
 # =================================================================
 # DLP Inverse Model Training (Gray Mode)
 # Task: Thresholded LD -> Grayscale Mask (Soft Mask)
@@ -17,12 +17,15 @@ export CUDA_VISIBLE_DEVICES=0
 
 python main.py \
     task=inverse_1_gray \
+    LossFunction=BCEWithLogitsL1Loss \
     exp_name=dlp_inverse_gray_baseline_v1 \
+    wandb.project=dlp_inverse_peoject \
     \
     image.binarize_target=false \
     \
+    num_epochs=4 \
     training_accum_steps=4 \
-    batch_size=1 \
+    batch_size=2 \
     \
     evaluation.benchmark.enable=true \
     evaluation.benchmark.inverse_post.binarize=false \

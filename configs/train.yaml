@@ -52,6 +52,12 @@ evaluation:
     curing:
       threshold: 0.23529         # curing depth threshold (0~1, 60/255)
       binarize: true          # forward 출력도 threshold로 binary로 만들지 여부
+    mask_pixelize:
+      enable: true
+      size: 160          # coarse grid size (예: 160). infer_size=640이면 4x4 블록 평균이 됨
+      downsample: "mean" # mean(=area/avg) downsample
+      upsample: "nearest"
+      apply_to: "corr"   # "both" | "naive" | "corr"
 
 
 # ✅ DLP image I/O 공통 옵션 (Dataset/Transform에서 사용)
@@ -75,7 +81,6 @@ wandb:
   log_images_split: "val"   # "train" | "val"
 
   use_visLogging: true
-  use_receptiveField: false
 
 # ✅ [Log Path Fix] Hydra 로그가 현재 폴더에 쌓이지 않도록 경로 지정
 hydra:
