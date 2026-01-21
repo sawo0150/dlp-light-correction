@@ -23,7 +23,9 @@ python main.py \
     exp_name=dlp_forward_mask2ld_baseline_v0 \
     image.binarize_target=false \
     training_accum_steps=4 \
-    batch_size=1 \
+    batch_size=2 \
+    evaluation.benchmark.enable=false \
+    evaluation.benchmark.proxy_checkpoint="none" \
     hydra.job.chdir=false
 
 # Tip: 로그를 파일로 남기며 백그라운드에서 돌리려면 아래 주석 해제 후 사용

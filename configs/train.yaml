@@ -4,7 +4,7 @@ defaults:
   - _self_
 
   # ✅ DLP task 선택 (inverse부터)
-  - task: inverse_1
+  - task: inverse_1_gray
 
   # ✅ DLP 모델/데이터/로스는 새 그룹으로 분리
   # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)
@@ -26,7 +26,7 @@ batch_size: 1
 val_batch_size: 1
 training_accum_steps: 4 # 🟢 추가: 1장씩 4번 모아서 업데이트 (실제 배치 4 효과)
 training_amp: true   # 🔴 False (또는 주석) -> true 로 변경
-num_epochs: 50
+num_epochs: 5
 warmup_epochs: 0
 
 lr: 1e-3
@@ -35,6 +35,24 @@ seed: 430
 num_workers: 8
 
 exp_name: dlp_inverse_thr2mask_baseline
+
+# ✅ [New] Evaluation / Benchmark Config
+evaluation:
+  benchmark:
+    enable: true
+    data_root: "data/benchmark_160"
+    proxy_checkpoint: "../result/forward_1/checkpoints/best_model.pt" # Forward 모델(Simulator) 경로
+    log_every_n_epochs: 1
+    forward_post:
+      apply_sigmoid: true   # ✅ forward output이 logits면 true
+    inverse_post:
+      apply_sigmoid: true     # logits -> sigmoid(prob) 적용 여부
+      binarize: true          # prob(or raw) -> binary mask 적용 여부
+      binarize_thr: 0.5       # binarize threshold (0~1)
+    curing:
+      threshold: 0.23529         # curing depth threshold (0~1, 60/255)
+      binarize: true          # forward 출력도 threshold로 binary로 만들지 여부
+
 
 # ✅ DLP image I/O 공통 옵션 (Dataset/Transform에서 사용)
 image:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from importlib import import_module
 import inspect
+from typing import Any
 
 try:
     import wandb
@@ -37,6 +38,9 @@ import torch.nn.functional as F
 from utils.data.dataloader_factory import create_data_loaders
 from utils.logging.wandb_logger import WandbLogger
 from utils.common.utils import compute_segmentation_metrics, compute_regression_metrics
+from utils.evaluation.benchmark_dataset import BenchmarkDataset
+from utils.evaluation.proxy_forward import ProxyForwardModel
+from utils.evaluation.reporter import BenchmarkReporter
 
 
 # (선택) metric logger는 간단히 숫자만 찍도록 축소
@@ -467,6 +471,63 @@ def train(args):
     print(f"[Hydra-eval] {eval_cfg}")
     print(f"[Hydra-eval] lb_enable={lb_enable}, lb_every={lb_every}")
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # ✅ [Benchmark Init] 벤치마크 리포터 초기화
+    # ──────────────────────────────────────────────────────────────────────────
+    bench_cfg = eval_cfg.get("benchmark", {})
+    bench_enabled = bench_cfg.get("enable", False)
+    benchmark_reporter = None
+
+    if bench_enabled:
+        print(f"[Benchmark] Initializing Reporter... (Proxy: {bench_cfg.get('proxy_checkpoint')})")
+
+        # 1. Dataset & Proxy Load
+        bench_loader = BenchmarkDataset(root=bench_cfg.get("data_root", "data/benchmark_160"))
+        proxy_model = ProxyForwardModel(ckpt_path=bench_cfg.get("proxy_checkpoint", ""), device=device)
+        # 1.5. Post-process configs (robust parsing)
+        inv_post: Dict[str, Any] = bench_cfg.get("inverse_post", {}) or {}
+        curing_cfg: Dict[str, Any] = bench_cfg.get("curing", {}) or {}
+        fwd_post: Dict[str, Any] = bench_cfg.get("forward_post", {}) or {}
+        fwd_apply_sigmoid = bool(fwd_post.get("apply_sigmoid", False))
+
+        inv_apply_sigmoid = bool(inv_post.get("apply_sigmoid", True))
+        inv_binarize      = bool(inv_post.get("binarize", True))
+        inv_bin_thr       = float(inv_post.get("binarize_thr", 0.5))
+
+        curing_thr        = float(curing_cfg.get("threshold", 0.5))
+        curing_binarize   = bool(curing_cfg.get("binarize", True))
+
+        print(
+            f"[Benchmark] inverse_post: apply_sigmoid={inv_apply_sigmoid}, "
+            f"binarize={inv_binarize}, thr={inv_bin_thr} | "
+            f"curing: thr={curing_thr}, binarize={curing_binarize}"
+        )
+
+        # 2. Model Input Size Resolution (✅ forward 학습 out_size를 우선 사용)
+        task_cfg = getattr(args, "task", {}) or {}
+        fwd_cfg = task_cfg.get("forward", {}) if isinstance(task_cfg, dict) else {}
+        fwd_pre = (fwd_cfg.get("preprocess", {}) or {}) if isinstance(fwd_cfg, dict) else {}
+        model_in_size = int(fwd_pre.get("out_size", 640))  # Default 640
+        fwd_binarize_input = bool((fwd_cfg or {}).get("binarize_input", False))
+
+        # 3. Reporter Init
+        benchmark_reporter = BenchmarkReporter(
+            inverse_model=model,
+            forward_model=proxy_model,
+            device=device,
+            image_size=640,          # Visualization Size (Canvas)
+            model_input_size=model_in_size,
+            inverse_apply_sigmoid=inv_apply_sigmoid,
+            inverse_binarize=inv_binarize,
+            inverse_binarize_thr=inv_bin_thr,
+            curing_threshold=curing_thr,
+            curing_binarize=curing_binarize,
+            forward_binarize_input=fwd_binarize_input,
+            forward_apply_sigmoid=fwd_apply_sigmoid,
+        )
+        bench_freq = int(bench_cfg.get("log_every_n_epochs", 1))
+
+
     val_loader = create_data_loaders(args=args, split="val", shuffle=False, is_train=False)
     task_name = _get_task_name_from_args(args)
     global_iter = 0
@@ -585,6 +646,18 @@ def train(args):
                 logger.log_epoch_images(model=model, loader=train_loader, epoch=epoch, split_name="train", device=device, step=global_iter)
             else:
                 logger.log_epoch_images(model=model, loader=val_loader, epoch=epoch, split_name="val", device=device, step=global_iter)
+
+        # ──────────────────────────────────────────────────────────────────────
+        # ✅ [Benchmark Report] 벤치마크 리포트 생성 및 W&B 전송
+        # ──────────────────────────────────────────────────────────────────────
+        if bench_enabled and benchmark_reporter and ((epoch + 1) % bench_freq == 0):
+            print(f"[Benchmark] Generating Visual Report (Epoch {epoch})...")
+            # Report 생성 (Dict[str, wandb.Image])
+            report_imgs = benchmark_reporter.generate_report(bench_loader)
+            
+            # W&B Logging
+            if logger.enabled and wandb.run is not None:
+                wandb.log(report_imgs, step=global_iter)
 
         # best 모델 저장은 기존 로직 유지 (wandb artifact는 main/train에서 선택적으로 추가 가능)
         if getattr(args, "use_wandb", False) and (wandb is not None) and (getattr(wandb, "run", None) is not None):

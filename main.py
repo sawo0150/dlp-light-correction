@@ -41,7 +41,8 @@ def _flatten_cfg_to_args(cfg: DictConfig) -> SimpleNamespace:
 
             # ✅ DLP 최소 구성: train.yaml에 남긴 것만 preserve
             PRESERVE = {"task", "model", "data", "LossFunction", "optimizer", 
-                        "LRscheduler", "image", "filters", "wandb"}
+                        "LRscheduler", "image", "filters", "wandb",
+                        "evaluation"}  # ✅ 추가: benchmark 설정 전달
  
 
             # (1) 보존용 속성 먼저 세팅

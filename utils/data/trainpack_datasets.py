@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -173,6 +174,7 @@ class ForwardMask2LDDataset(Dataset):
 
         fwd = (self.task_cfg.get("forward") or {})
         self.input_key = (fwd.get("input_key", "mask_160") or "mask_160")  # mask_128|mask_160|mask_1280
+        self.binarize_input = bool(fwd.get("binarize_input", False))
         pre = (fwd.get("preprocess") or {})
         self.out_size = int(pre.get("out_size", self.image_cfg.size))      # LD output size
 
@@ -206,6 +208,10 @@ class ForwardMask2LDDataset(Dataset):
         x = u8_to_float(x_u8, self.image_cfg.normalize)
         y = u8_to_float(y_u8, self.image_cfg.normalize)
 
+        # ✅ forward input policy: optional binarize to match config
+        if self.binarize_input:
+            x = binarize01(x, 0.5)
+
         meta = {
             "sample_key": r.sample_key,
             "dataset": r.dataset,
@@ -213,6 +219,7 @@ class ForwardMask2LDDataset(Dataset):
             "x_path": str(x_path),
             "y_path": str(y_path),
             "input_key": self.input_key,
+            "binarize_input": self.binarize_input,
             "out_size": self.out_size,
         }
         return to_chw_torch(x), to_chw_torch(y), meta
