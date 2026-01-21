@@ -1,0 +1,21 @@
+# configs/task/forward_1.yaml
+# Forward_1: mask -> light distribution (LD)
+
+name: forward_1
+
+forward:
+  # input policy
+  input_key: "mask_160"     # ["mask_128", "mask_160", "mask_1280"]
+  binarize_input: false      # mask 입력을 {0,1}로 강제(권장, baseline 안정화)
+
+  # output policy
+  target_key: "ld_1280_aligned"  # manifest의 ld_1280_aligned_path
+
+  preprocess:
+    out_size: 640           # ✅ baseline은 640 추천(가볍게). 최종 1280이면 1280으로.
+
+  data:
+    modes: ["binary", "gray"]       # baseline은 binary만
+    split_source: "manifest"
+    dataset_allow: []
+    qc_filter: ""

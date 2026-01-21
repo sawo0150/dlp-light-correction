@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, List
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt  # ✅ 시각화를 위해 추가
 
 try:
     import wandb
@@ -33,16 +34,47 @@ def _as_numpy_01(x: torch.Tensor) -> np.ndarray:
     x = torch.clamp(x, 0.0, 1.0)
     return x.numpy().astype(np.float32)
 
+def _to_rgb(img_gray: np.ndarray) -> np.ndarray:
+    """
+    (H, W) -> (H, W, 3) RGB로 변환 (Concatenation을 위해)
+    """
+    if img_gray.ndim == 2:
+        return np.stack([img_gray]*3, axis=-1)
+    return img_gray
+
+def _get_error_heatmap(diff: np.ndarray) -> np.ndarray:
+    """
+    diff: (H, W) range approx [-1, 1]
+    Returns: (H, W, 3) RGB numpy array using 'bwr' colormap
+    - Red (>0): Pred > Target (Over / False Positive)
+    - Blue (<0): Pred < Target (Under / False Negative)
+    - White (0): Match
+    """
+    # 1. Normalize differences to [-1, 1] for colormap
+    #    For binary, diff is exactly -1, 0, 1.
+    #    For continuous, we might want to clip or normalize by max abs.
+    max_val = np.max(np.abs(diff)) + 1e-6
+    norm_diff = diff / (max_val) # Now inside [-1, 1]
+    
+    # 2. Shift to [0, 1] for matplotlib colormap (0.5 is center)
+    #    -1 -> 0.0 (Blue), 0 -> 0.5 (White), 1 -> 1.0 (Red)
+    diff_shifted = (norm_diff + 1) / 2.0
+    
+    # 3. Apply Colormap (bwr: Blue-White-Red)
+    cmap = plt.get_cmap('bwr')
+    heatmap = cmap(diff_shifted)[:, :, :3] # RGBA -> RGB
+    return heatmap.astype(np.float32)
+
 def _concat_row(imgs: List[np.ndarray]) -> np.ndarray:
     """
-    imgs: list of [H,W] float32 in [0,1]
-    returns: [H, W*len(imgs)]
+    imgs: list of [H,W,3] float32 in [0,1]
+    returns: [H, W*len(imgs), 3]
     """
     # ensure same H,W
-    h, w = imgs[0].shape
+    h, w, c = imgs[0].shape
     out = []
     for im in imgs:
-        if im.shape != (h, w):
+        if im.shape != (h, w, c):
             raise ValueError(f"Image shape mismatch: expected {(h,w)}, got {im.shape}")
         out.append(im)
     return np.concatenate(out, axis=1)
@@ -57,6 +89,12 @@ class WandbLogger:
         self.enabled = bool(getattr(args, "use_wandb", False)) and _wandb_on()
         self.cfg = self._parse_cfg(args)
 
+        task_cfg = getattr(args, "task", {})
+        if isinstance(task_cfg, dict):
+            self.task_name = str(task_cfg.get("name", "")).strip()
+        else:
+            self.task_name = str(task_cfg).strip()
+    
     def _parse_cfg(self, args: Any) -> WandbLogConfig:
         wb = getattr(args, "wandb", {})
         if isinstance(wb, dict):
@@ -158,16 +196,26 @@ class WandbLogger:
 
         images = []     # each element is ONE composite image per sample: [input|target|pred|error]
         count = 0
+        # ✅ Forward Task인지 확인
+        is_forward = self.task_name.startswith("forward")
+
         for x, y, meta in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
             logits = model(x)
             prob = torch.sigmoid(logits)
-            pred = (prob >= thr).float()
-            
-            # ✅ error map: target - pred (binary mismatch), easier to read
-            err = (pred - y).abs()
+
+            # 🔴 [FIX] Forward면 이진화 금지 (Continuous), Inverse면 이진화 (Binary)
+            # SigmoidL1Loss를 사용하므로 prob(0~1)가 곧 prediction입니다.
+            if is_forward:
+                pred = prob  # 있는 그대로 (0.0 ~ 1.0)
+            else:
+                pred = (prob >= thr).float() # 이진화 (0 or 1) 
+
+            # ✅ [Modified] error map: Signed Difference
+            # ✅ Error Map: 단순 차이 (Pred - Target)
+            diff_tensor = pred - y
 
             bsz = x.shape[0]
             for bi in range(bsz):
@@ -188,10 +236,12 @@ class WandbLogger:
                 y_img = _as_numpy_01(y[bi, 0])
 
                 p_img = _as_numpy_01(pred[bi, 0])   # ✅ pred는 binary로 (요청: input/target/pred/error)
-                e_img = _as_numpy_01(err[bi, 0])    # 0/1 mismatch map
+                
+                d_img = diff_tensor[bi, 0].detach().cpu().numpy()
+                e_img = _get_error_heatmap(d_img)   # ✅ RGB Heatmap 변환
 
-                # ✅ 한 장으로 붙이기: [input | target | pred | error]
-                row = _concat_row([x_img, y_img, p_img, e_img])
+                # ✅ RGB로 통일하여 붙이기: [input | target | pred | error]
+                row = _concat_row([_to_rgb(x_img), _to_rgb(y_img), _to_rgb(p_img), e_img])
                 images.append(
                     wandb.Image(
                         row,

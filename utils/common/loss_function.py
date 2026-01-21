@@ -142,3 +142,21 @@ class BCEWithLogitsL1Loss(nn.Module):
         probs = torch.sigmoid(logits)
         l1 = self.l1(probs, target)
         return self.w_bce * bce + self.w_l1 * l1
+
+class SigmoidL1Loss(nn.Module):
+    """
+    For regression targets in [0,1] when model outputs logits.
+    loss = L1(sigmoid(logits), target)
+
+    - forward LD 같은 continuous target에 적합.
+    - target은 float [0,1] 가정.
+    """
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"Invalid reduction: {reduction}")
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = torch.sigmoid(logits)
+        return F.l1_loss(pred, target, reduction=self.reduction)

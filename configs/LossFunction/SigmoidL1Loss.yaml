@@ -1,0 +1,4 @@
+# configs/LossFunction/SigmoidL1Loss.yaml
+
+_target_: utils.common.loss_function.SigmoidL1Loss
+reduction: "mean"

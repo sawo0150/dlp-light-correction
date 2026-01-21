@@ -32,26 +32,22 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf     
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_  
+import torch.nn.functional as F
 
-from utils.data.load_data import create_data_loaders
+from utils.data.dataloader_factory import create_data_loaders
 from utils.logging.wandb_logger import WandbLogger
+from utils.common.utils import compute_segmentation_metrics, compute_regression_metrics
 
 
 # (선택) metric logger는 간단히 숫자만 찍도록 축소
 
-def _dice_iou_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6):
-    """
-    logits: [B,1,H,W] (unbounded) or probs
-    target: [B,1,H,W] in {0,1}
-    """
-    probs = torch.sigmoid(logits)
-    pred = (probs >= 0.5).float()
-    inter = (pred * target).sum(dim=(1,2,3))
-    union = (pred + target - pred*target).sum(dim=(1,2,3))
-    dice = (2*inter + eps) / (pred.sum(dim=(1,2,3)) + target.sum(dim=(1,2,3)) + eps)
-    iou = (inter + eps) / (union + eps)
-    return dice.mean().item(), iou.mean().item()
- 
+def _get_task_name_from_args(args) -> str:
+    task_cfg = getattr(args, "task", {}) or {}
+    if isinstance(task_cfg, dict):
+        return str(task_cfg.get("name", "")).strip()
+    return str(task_cfg)
+
+
 def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
                 loss_fn,
                 scaler, amp_enabled, accum_steps,
@@ -77,6 +73,7 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
                 desc=f"Epoch[{epoch:2d}/{args.num_epochs}]/")
 
     start_iter = time.perf_counter()
+    task_name = _get_task_name_from_args(args)
     for iter, data in pbar:
         # DLP: (x, y, meta)
         x, y, meta = data
@@ -143,11 +140,17 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
                     scheduler.step()
 
         total_loss += float(loss.detach().item()) * accum_steps
-        dice, iou = _dice_iou_from_logits(logits.detach(), y.detach())
+        if task_name.startswith("inverse"):
+            m1, m2 = compute_segmentation_metrics(logits.detach(), y.detach())
+            postfix = f"loss {total_loss/(iter+1):.4g} | D {m1:.3f} | I {m2:.3f}"
+        elif task_name.startswith("forward"):
+            mae, rmse, psnr = compute_regression_metrics(logits.detach(), y.detach())
+            postfix = f"loss {total_loss/(iter+1):.4g} | MAE {mae:.3f} | RMSE {rmse:.3f} | PSNR {psnr:.2f}"
+        else:
+            postfix = f"loss {total_loss/(iter+1):.4g}"
 
         # ✅ postfix를 문자열로 넣으면 잘림이 덜하고, 출력 제어가 쉬움
-        avg_loss = total_loss / (iter + 1)
-        pbar.set_postfix_str(f"loss {avg_loss:.4g} | D {dice:.3f} | I {iou:.3f}")
+        pbar.set_postfix_str(postfix)
 
         # ✅ Train metric: iter 단위 로깅 (N iters마다)
         if logger.enabled:
@@ -155,15 +158,41 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
             log_every = int(wb_cfg.get("log_every_n_iters", 0) or 0) if isinstance(wb_cfg, dict) else 0
             if log_every and (iter > 0) and (iter % log_every == 0):
                 lr = optimizer.param_groups[0]["lr"] if optimizer else 0.0
-                logger.log_train_iter(
-                    step=global_iter_start + iter,
-                    epoch=epoch,
-                    it=iter,
-                    loss=float(loss.detach().item() * accum_steps),
-                    dice=float(dice),
-                    iou=float(iou),
-                    lr=float(lr),
-                )
+                # inverse/forward 공통으로 loss는 기록하고, 나머지는 task별로 다르게
+                if task_name.startswith("inverse"):
+                    dice, iou = compute_segmentation_metrics(logits.detach(), y.detach())
+                    logger.log_train_iter(
+                        step=global_iter_start + iter,
+                        epoch=epoch,
+                        it=iter,
+                        loss=float(loss.detach().item() * accum_steps),
+                        dice=float(dice),
+                        iou=float(iou),
+                        lr=float(lr),
+                    )
+                elif task_name.startswith("forward"):
+                    mae, rmse, psnr = compute_regression_metrics(logits.detach(), y.detach())
+                    # wandb_logger에 forward용 키가 없을 수도 있으니, 최소 호환으로 dice/iou 자리에 mae/rmse를 넣어도 되고
+                    # (권장) wandb_logger 쪽을 확장하는 게 맞음. 일단 안전하게 meta만 남기고 loss 위주로 기록.
+                    logger.log_train_iter(
+                        step=global_iter_start + iter,
+                        epoch=epoch,
+                        it=iter,
+                        loss=float(loss.detach().item() * accum_steps),
+                        dice=float(mae),   # backward compat slot
+                        iou=float(rmse),    # backward compat slot
+                        lr=float(lr),
+                    )
+                else:
+                    logger.log_train_iter(
+                        step=global_iter_start + iter,
+                        epoch=epoch,
+                        it=iter,
+                        loss=float(loss.detach().item() * accum_steps),
+                        dice=0.0,
+                        iou=0.0,
+                        lr=float(lr),
+                    )
 
         del logits, loss
         torch.cuda.empty_cache()
@@ -179,6 +208,10 @@ def validate(args, model, data_loader, epoch, loss_fn):
     total_dice = 0.0
     total_iou  = 0.0
     n_batches  = 0
+    task_name = _get_task_name_from_args(args)
+    total_m1 = 0.0
+    total_m2 = 0.0
+    total_m3 = 0.0
     
     len_loader = len(data_loader)                 # ← 전체 길이
     pbar = tqdm(enumerate(data_loader),           # ← tqdm 래퍼
@@ -195,25 +228,50 @@ def validate(args, model, data_loader, epoch, loss_fn):
 
             logits = model(x)
             loss = loss_fn(logits, y)
-            dice, iou = _dice_iou_from_logits(logits, y)
+            if task_name.startswith("inverse"):
+                m1, m2 = compute_segmentation_metrics(logits, y)  # dice/iou
+                total_m1 += float(m1)
+                total_m2 += float(m2)
+            elif task_name.startswith("forward"):
+                mae, rmse, psnr = compute_regression_metrics(logits, y)
+                total_m1 += float(mae)
+                total_m2 += float(rmse)
+                total_m3 += float(psnr)
 
             total_loss += float(loss.item())
-            total_dice += float(dice)
-            total_iou  += float(iou)
             n_batches += 1
 
             avg_loss = total_loss / n_batches
-            avg_dice = total_dice / n_batches
-            avg_iou  = total_iou / n_batches
-            pbar.set_postfix_str(f"loss {avg_loss:.4g} | D {avg_dice:.3f} | I {avg_iou:.3f}")
+            if task_name.startswith("inverse"):
+                avg_dice = total_m1 / n_batches
+                avg_iou  = total_m2 / n_batches
+                pbar.set_postfix_str(f"loss {avg_loss:.4g} | D {avg_dice:.3f} | I {avg_iou:.3f}")
+            elif task_name.startswith("forward"):
+                avg_mae  = total_m1 / n_batches
+                avg_rmse = total_m2 / n_batches
+                avg_psnr = total_m3 / n_batches
+                pbar.set_postfix_str(f"loss {avg_loss:.4g} | MAE {avg_mae:.3f} | RMSE {avg_rmse:.3f} | PSNR {avg_psnr:.2f}")
+            else:
+                pbar.set_postfix_str(f"loss {avg_loss:.4g}")
 
         torch.cuda.empty_cache()
 
     metric_loss = total_loss / max(1, n_batches)
-    metric_dice = total_dice / max(1, n_batches)
-    metric_iou  = total_iou  / max(1, n_batches)
-    return metric_loss, metric_dice, metric_iou, time.perf_counter() - start
- 
+    if task_name.startswith("inverse"):
+        metric_m1 = total_m1 / max(1, n_batches)  # dice
+        metric_m2 = total_m2 / max(1, n_batches)  # iou
+        metric_m3 = 0.0
+    elif task_name.startswith("forward"):
+        metric_m1 = total_m1 / max(1, n_batches)  # mae
+        metric_m2 = total_m2 / max(1, n_batches)  # rmse
+        metric_m3 = total_m3 / max(1, n_batches)  # psnr
+    else:
+        metric_m1 = 0.0
+        metric_m2 = 0.0
+        metric_m3 = 0.0
+
+    return metric_loss, metric_m1, metric_m2, metric_m3, time.perf_counter() - start
+
 
 def save_model(args, exp_dir, epoch, model, optimizer, best_val_loss, is_new_best):
     
@@ -304,8 +362,6 @@ def train(args):
     # Hydra instantiate로 생성 (params 인자로 모델 파라미터 전달)
     optimizer = instantiate(OmegaConf.create(optim_cfg), params=model.parameters())
     print(f"[Hydra] optimizer ▶ {optimizer.__class__.__name__}")
-    # ──────────────────────────────────────────────────────────────────────────
-    temp_loader = create_data_loaders(args=args, split="train", shuffle=True, is_train=True)
 
     # ──────────────── LR Scheduler (옵션) ────────────────
     # [수정] DeepSpeed 분기 제거하고 바로 Scheduler 생성 로직 수행
@@ -355,11 +411,14 @@ def train(args):
     augmenter = None
     mask_augmenter = None
 
+    # ✅ [Bug Fix] Initialize val_loss_history BEFORE loading check
+    val_loss_history = []
+    
     # ── Resume logic (이제 model, optimizer가 정의된 이후) ──
     start_epoch   = 0
     best_val_loss = float('inf')
     best_val_ssim = 0.0
-    val_loss_history = [] # val loss기록 for augmenter
+    best_val_score = -float('inf')  # inverse: dice 최대, forward: -val_loss 최대(=val_loss 최소)
 
     print(f"[Resume] {getattr(args, 'resume_checkpoint', None)}")
     if getattr(args, 'resume_checkpoint', None):
@@ -408,9 +467,8 @@ def train(args):
     print(f"[Hydra-eval] {eval_cfg}")
     print(f"[Hydra-eval] lb_enable={lb_enable}, lb_every={lb_every}")
 
-    # train_loader = create_data_loaders(data_path = args.data_path_train, args = args, shuffle=True) # 매 에폭마다 생성 예정
     val_loader = create_data_loaders(args=args, split="val", shuffle=False, is_train=False)
-    
+    task_name = _get_task_name_from_args(args)
     global_iter = 0
 
     # ▲ Resume 시 기존 val_loss_log를 불러와 이어서 기록
@@ -442,7 +500,7 @@ def train(args):
          )
         global_iter += len(train_loader)    # ✅ 이 시점의 global_iter가 "epoch 끝 step"
         
-        val_loss, val_dice, val_iou, val_time = validate(args, model, val_loader, epoch, loss_fn)
+        val_loss, val_m1, val_m2, val_m3, val_time = validate(args, model, val_loader, epoch, loss_fn)
 
         # ✨ val_loss 기록 (스케줄러 및 체크포인트용)
         val_loss_history.append(val_loss)
@@ -457,9 +515,20 @@ def train(args):
         # num_subjects = torch.tensor(num_subjects).cuda(non_blocking=True)
 
         # inverse에서는 dice 기준으로 best 선택 (원하면 iou/val_loss로 변경)
-        is_new_best = val_dice > best_val_ssim
-        best_val_loss = min(best_val_loss, val_loss)
-        best_val_ssim = max(best_val_ssim, val_dice)
+        if task_name.startswith("inverse"):
+            # val_m1 = dice
+            score = float(val_m1)
+            is_new_best = score > best_val_score
+            best_val_score = max(best_val_score, score)
+            best_val_loss = min(best_val_loss, val_loss)
+        elif task_name.startswith("forward"):
+            # forward는 loss 최소화
+            score = -float(val_loss)
+            is_new_best = score > best_val_score
+            best_val_score = max(best_val_score, score)
+            best_val_loss = min(best_val_loss, val_loss)
+        else:
+            is_new_best = False
 
         # ✨ save_model에 val_loss_history 추가 (상태 저장을 위해)
         checkpoint = {
@@ -468,8 +537,8 @@ def train(args):
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            'scaler': scaler.state_dict(),                  # ← 추가
-            'best_val_ssim': best_val_ssim,
+            'scaler': scaler.state_dict(),          
+            'best_val_score': best_val_score,
             'best_val_loss': best_val_loss,
             'exp_dir': str(args.exp_dir),
             'val_loss_history': val_loss_history 
@@ -490,14 +559,22 @@ def train(args):
         # ✅ Val/Test metric: epoch 단위 로깅
         if logger.enabled:
             lr = optimizer.param_groups[0]["lr"] if optimizer else 0.0
+            # backward compat: val_dice/val_iou 슬롯을 task별로 재사용
+            if task_name.startswith("inverse"):
+                v1, v2 = float(val_m1), float(val_m2)  # dice/iou
+            elif task_name.startswith("forward"):
+                v1, v2 = float(val_m1), float(val_m2)  # mae/rmse
+            else:
+                v1, v2 = 0.0, 0.0
+
             logger.log_epoch_metrics(
                 epoch=epoch,
                 train_loss=float(train_loss),
                 val_loss=float(val_loss),
-                val_dice=float(val_dice),
-                val_iou=float(val_iou),
+                val_dice=v1,
+                val_iou=v2,
                 lr=float(lr),
-                step=global_iter,   # ✅ step은 global_iter로 (단조 증가 보장)
+                step=global_iter,
             )
 
         # ✅ Epoch 이미지 로깅 (train/val 선택)
@@ -517,7 +594,7 @@ def train(args):
         print(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] '
             f'TrainLoss = {train_loss:.4g} ValLoss = {val_loss:.4g} '
-            f'ValDice = {val_dice:.4g} ValIoU = {val_iou:.4g} '
+            f'ValM1 = {val_m1:.4g} ValM2 = {val_m2:.4g} '
             f'TrainTime = {train_time:.2f}s ValTime = {val_time:.2f}s',
         )
 
