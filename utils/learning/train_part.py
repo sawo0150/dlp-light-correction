@@ -86,6 +86,8 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
 
         with autocast(enabled=amp_enabled):
             logits = model(x)
+            # loss_fn은 (logits, target) 형태를 가정
+            loss = loss_fn(logits, y) / accum_steps
 
         # ✅ [VRAM 로깅 추가] report_interval 마다 VRAM 사용량 출력
         if iter > 0 and iter % args.report_interval == 0:
@@ -94,8 +96,6 @@ def train_epoch(args, epoch, model, data_loader, optimizer, scheduler,
             vram_peak = torch.cuda.max_memory_allocated() / 1024**2
             print(f"\n  [VRAM at iter {iter}] Allocated: {vram_alloc:.2f} MB | Peak: {vram_peak:.2f} MB")
             
-        # loss_fn은 (logits, target) 형태를 가정
-        loss = loss_fn(logits, y) / accum_steps
 
         # print("max alloc MB:", torch.cuda.max_memory_allocated() / 1024**2)
         # print("max memory_reserved MB:", torch.cuda.torch.cuda.max_memory_reserved() / 1024**2)
