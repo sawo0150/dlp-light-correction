@@ -5,7 +5,7 @@ import torch.nn as nn
 import numpy as np
 import cv2
 import wandb
-from typing import Dict, List
+from typing import Dict, List, Any, Tuple
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
@@ -61,6 +61,28 @@ class BenchmarkReporter:
         self.mp_down = str(mask_pixelize_downsample).lower()
         self.mp_up = str(mask_pixelize_upsample).lower()
         self.mp_apply_to = str(mask_pixelize_apply_to).lower()
+
+    # ---------------------------------------------------------------------
+    # ✅ Metrics helpers
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _bin01(x: torch.Tensor, thr: float = 0.5) -> torch.Tensor:
+        """x: [B,1,H,W] float -> {0,1} float"""
+        return (x >= thr).float()
+
+    def _count_error_pixels(self, pred01: torch.Tensor, target01: torch.Tensor) -> Tuple[int, int]:
+        """
+        Count mismatched pixels between pred and target (both mask-like).
+        Returns:
+          (err_px, total_px) as python ints
+        """
+        # 안전하게 binary화 (curing_binarize=False인 경우도 대비)
+        p = self._bin01(pred01, 0.5)
+        t = self._bin01(target01, 0.5)
+        # XOR mismatch
+        err = (p != t).sum()
+        total = t.numel()
+        return int(err.item()), int(total)
 
     def _postprocess_forward(self, out: torch.Tensor) -> torch.Tensor:
         # forward model output이 logits인 경우에만 sigmoid
@@ -162,13 +184,19 @@ class BenchmarkReporter:
         
         return (heatmap * 255).astype(np.uint8)
 
-    def _process_category(self, dataset: BenchmarkDataset) -> np.ndarray:
+    def _process_category(self, dataset: BenchmarkDataset) -> Tuple[np.ndarray, Dict[str, float]]:
         """
         Process category -> Horizontal Stitch of columns.
         """
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
         row_images = []
         
+        # ✅ Metrics accumulators (category-level)
+        naive_err_sum = 0
+        corr_err_sum  = 0
+        total_px_sum  = 0
+        n_samples     = 0
+
         # Text settings
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale, font_color, thickness = 0.4, (0,0,0), 1
@@ -210,6 +238,20 @@ class BenchmarkReporter:
                 Corrected_Print_infer = self.forward_model(Corr_in)
                 Corrected_Print_infer = self._apply_curing(Corrected_Print_infer)
  
+                # ✅ ----------------------------------------------------------
+                # ✅ Metrics per-sample (error pixels vs target at infer resolution)
+                # ✅ ----------------------------------------------------------
+                # target도 infer resolution에서 비교(학습/forward 입력과 같은 해상도)
+                T_bin_infer = self._bin01(T_infer_t, 0.5)
+                # pred는 curing 결과가 binary일 확률이 높지만, 안전하게 binarize
+                naive_err, total_px = self._count_error_pixels(Naive_Print_infer, T_bin_infer)
+                corr_err,  _        = self._count_error_pixels(Corrected_Print_infer, T_bin_infer)
+
+                naive_err_sum += naive_err
+                corr_err_sum  += corr_err
+                total_px_sum  += total_px
+                n_samples     += 1
+  
             # --- Visualization Prep (Resize back to 160) ---
             
             # Row 1: Target
@@ -280,13 +322,68 @@ class BenchmarkReporter:
             return np.zeros((100, 100, 3), dtype=np.uint8)
             
         # ✅ stack samples vertically
-        return cv2.vconcat(row_images)
+        grid = cv2.vconcat(row_images)
 
-    def generate_report(self, full_dataset: BenchmarkDataset) -> Dict[str, wandb.Image]:
+        # ✅ Category metrics
+        if total_px_sum <= 0:
+            metrics = {
+                "corr_err_px": 0.0,
+                "corr_err_rate": 0.0,
+                "err_reduction": 0.0,
+            }
+            return grid, metrics
+
+        naive_rate = float(naive_err_sum) / float(total_px_sum)
+        corr_rate  = float(corr_err_sum)  / float(total_px_sum)
+        # reduction = (naive - corr) / naive
+        if naive_err_sum > 0:
+            reduction = float(naive_err_sum - corr_err_sum) / float(naive_err_sum)
+        else:
+            # naive가 완벽(0 error)이면 reduction 정의가 애매하므로 0으로 둠
+            reduction = 0.0
+
+        metrics = {
+            "corr_err_px": float(corr_err_sum),
+            "corr_err_rate": float(corr_rate),
+            "err_reduction": float(reduction),
+        }
+        return grid, metrics
+
+    def generate_report(self, full_dataset: BenchmarkDataset) -> Dict[str, Any]:
         categories = full_dataset.get_categories()
         report = {}
+        # ✅ overall accumulator
+        overall = {
+            "corr_err_px": 0.0,
+            "total_px": 0.0,
+            "samples": 0.0,  # overall rate 계산용(=infer_size^2 * samples)
+        }
+
         for cat in categories:
             subset = full_dataset.get_subset_by_category(cat)
-            grid_img = self._process_category(subset)
+            grid_img, m = self._process_category(subset)
             report[f"Report/{cat}"] = wandb.Image(grid_img, caption=f"Category: {cat}")
+
+            # ✅ log category metrics as scalars
+            report[f"Metrics/{cat}/corr_err_px"]    = m["corr_err_px"]
+            report[f"Metrics/{cat}/corr_err_rate"]  = m["corr_err_rate"]
+            report[f"Metrics/{cat}/err_reduction"]  = m["err_reduction"]
+
+            # accumulate overall
+            overall["corr_err_px"]  += m["corr_err_px"]
+            # total_px는 category에서 직접 안 주고 있어서 rate로부터 역추정은 위험함
+            # -> 여기서는 samples만 합하고, overall_rate는 아래에서 "infer_size*infer_size*samples"로 계산
+            # category별 샘플 수를 metrics에서 빼버렸으므로, overall은 별도 집계가 필요
+            # 가장 안전한 방법: _process_category에서 n_samples를 반환하지 않으니 여기서는 category dataset 길이로 추정
+            overall["samples"]      += float(len(subset))
+
+        # ✅ Overall metrics (rate 계산은 infer_size 기반으로 확정 가능)
+        if overall["samples"] > 0:
+            total_px = float(self.infer_size * self.infer_size) * float(overall["samples"])
+            report["Metrics/_overall/corr_err_px"]    = float(overall["corr_err_px"])
+            report["Metrics/_overall/corr_err_rate"]  = float(overall["corr_err_px"]) / total_px
+            # overall err_reduction은 naive_err_px를 로깅에서 제외했으므로 계산/로깅도 제외
+            # (원하면 다시 overall_naive_err_px만 내부적으로 집계해서 reduction만 남길 수도 있음)
+
+
         return report

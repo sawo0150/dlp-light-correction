@@ -562,6 +562,8 @@ def train(args):
         print(f'Epoch #{epoch:2d} ............... {args.exp_name} ...............')
         torch.cuda.empty_cache()
  
+        # ✅ NEW: dataloader_factory에서 epoch-dependent resampling에 사용
+        setattr(args, "_epoch", int(epoch))
         train_loader = create_data_loaders(args=args, split="train", shuffle=True, is_train=True)
  
 

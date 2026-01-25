@@ -30,3 +30,34 @@ inverse:
     split_source: "manifest"        # "manifest" | "txt" (원하면)
     dataset_allow: []               # 특정 dataset만 허용할 때
     qc_filter: ""                   # (아직 미구현이면 비워두기)
+
+    # ✅ NEW: 도메인 믹스(가중치). "B1"처럼 prefix로 줘도 되고, "B1_Shape_Cutout"처럼 full name도 OK
+    domain:
+      enable: false    # true | false
+      weights:
+        B1: 1.0
+        B2: 0.0
+        B3: 0.0
+        B4: 0.0
+        B5: 0.0
+
+    # ✅ NEW: split별 샘플 수 상한(0/누락이면 제한 없음)
+    max_samples:
+      train: 0
+      val: 0
+      test: 0
+
+    # rows vs items 중 뭐를 "총 데이터 수"로 볼지 선택
+    # - rows: manifest row 기준(현재 네가 겪은 상황처럼 expand_all이면 iter 증가 가능)
+    # - items: 실제 dataloader iter 수 기준으로 제한
+    max_samples_unit: "items"   # or "items"
+
+    # ✅ NEW: epoch마다 train 샘플을 다시 뽑을지(원하면 true)
+    resample_each_epoch: false
+
+    # ✅ NEW: max_samples가 dataset 수보다 클 때 보충 허용(복원추출)
+    with_replacement: false
+    
+    debug:
+      enable: true
+      examples: 5

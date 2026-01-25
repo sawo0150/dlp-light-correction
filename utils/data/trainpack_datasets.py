@@ -6,6 +6,7 @@ import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 from torch.utils.data import Dataset
 
@@ -66,6 +67,26 @@ class InverseThr2MaskDataset(Dataset):
             self.thr_index = load_thr_file_index(Path(thr_index_path))
 
         self.items: List[Dict] = self._build_items()
+
+        # ✅ DEBUG: items 구성 통계 출력(옵션)
+        inv = (self.task_cfg.get("inverse") or {})
+        sub_data = (inv.get("data") or {})
+        dbg_cfg = dict(sub_data.get("debug", {}) or {})
+        dbg_enable = bool(dbg_cfg.get("enable", False))
+        if dbg_enable:
+            print(f"[DBG][InverseDataset] input_source={self.input_source} thr_random_policy={self.thr_random_policy} "
+                  f"target_key={self.target_key} out_size={self.out_size}")
+            print(f"[DBG][InverseDataset] rows_in={len(self.rows)} items_out={len(self.items)}")
+            # item 타입별 카운트
+            kind = defaultdict(int)
+            for it in self.items:
+                if "x_paths" in it:
+                    kind["random_one"] += 1
+                elif "x_path" in it:
+                    kind["single_path"] += 1
+                else:
+                    kind["unknown"] += 1
+            print(f"[DBG][InverseDataset] item_kinds={dict(kind)}")
 
         if len(self.items) == 0:
             raise RuntimeError("No samples after building inverse dataset items.")
