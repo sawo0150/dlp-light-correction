@@ -495,6 +495,7 @@ def train(args):
         curing_cfg: Dict[str, Any] = bench_cfg.get("curing", {}) or {}
         mp_cfg: Dict[str, Any] = bench_cfg.get("mask_pixelize", {}) or {}
         fwd_post: Dict[str, Any] = bench_cfg.get("forward_post", {}) or {}
+        doc_cfg: Dict[str, Any] = bench_cfg.get("doc", {}) or {}
         fwd_apply_sigmoid = bool(fwd_post.get("apply_sigmoid", False))
 
         inv_apply_sigmoid = bool(inv_post.get("apply_sigmoid", True))
@@ -510,10 +511,22 @@ def train(args):
         mp_up       = str(mp_cfg.get("upsample", "nearest")).lower()
         mp_apply_to = str(mp_cfg.get("apply_to", "both")).lower()
 
+        # ✅ DoC (eval)
+        doc_enable = bool(doc_cfg.get("enable", False))
+        doc_gauss = dict(doc_cfg.get("gauss", {}) or {})
+        doc_gauss_enable = bool(doc_gauss.get("enable", True))
+        doc_gauss_kernel_size = int(doc_gauss.get("kernel_size", 51))
+        doc_gauss_sigma = float(doc_gauss.get("sigma", 12.0))
+        doc_gauss_n_iter = int(doc_gauss.get("n_iter", 1))
+ 
         print(
             f"[Benchmark] inverse_post: apply_sigmoid={inv_apply_sigmoid}, "
             f"binarize={inv_binarize}, thr={inv_bin_thr} | "
             f"curing: thr={curing_thr}, binarize={curing_binarize}"
+        )
+        print(
+            f"[Benchmark] doc: enable={doc_enable} | "
+            f"gauss(enable={doc_gauss_enable}, ks={doc_gauss_kernel_size}, sigma={doc_gauss_sigma}, n_iter={doc_gauss_n_iter})"
         )
 
         # 2. Model Input Size Resolution (✅ forward 학습 out_size를 우선 사용)
@@ -542,6 +555,12 @@ def train(args):
             mask_pixelize_downsample=mp_down,
             mask_pixelize_upsample=mp_up,
             mask_pixelize_apply_to=mp_apply_to,
+            # ✅ NEW: DoC options for evaluation pipeline
+            doc_enable=doc_enable,
+            doc_gauss_enable=doc_gauss_enable,
+            doc_gauss_kernel_size=doc_gauss_kernel_size,
+            doc_gauss_sigma=doc_gauss_sigma,
+            doc_gauss_n_iter=doc_gauss_n_iter,
         )
         bench_freq = int(bench_cfg.get("log_every_n_epochs", 1))
 

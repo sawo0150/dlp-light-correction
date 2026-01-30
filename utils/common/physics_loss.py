@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from utils.evaluation.proxy_forward import ProxyForwardModel
 
@@ -19,6 +20,10 @@ class PhysicsInformedLoss(nn.Module):
     4. Soft Curing: Piecewise Linear Function (50~80 intensity)
     5. Loss: L1 distance between Soft-Cured Shape and Target Mask
     """
+    # NOTE:
+    # - "DoC" (degree of cure) stage is optional.
+    # - Keep LD->CI mapping via existing soft_curing() unchanged.
+ 
 
     def __init__(
         self,
@@ -27,6 +32,14 @@ class PhysicsInformedLoss(nn.Module):
         infer_size: int = 640,
         cure_thr_low: float = 50.0,
         cure_thr_high: float = 80.0,
+        # ✅ [NEW] DoC options (Hydra로 조절)
+        doc_enable: bool = False,
+        doc_gauss_enable: bool = True,
+        doc_gauss_kernel_size: int = 51,
+        doc_gauss_sigma: float = 12.0,
+        doc_gauss_n_iter: int = 1,
+        # ✅ forward model output policy (robust)
+        forward_output_is_logits: bool = True,
         device: str = "cuda"
     ):
         super().__init__()
@@ -35,6 +48,14 @@ class PhysicsInformedLoss(nn.Module):
         self.cure_thr_low = cure_thr_low
         self.cure_thr_high = cure_thr_high
         
+        # ✅ DoC config
+        self.doc_enable = bool(doc_enable)
+        self.doc_gauss_enable = bool(doc_gauss_enable)
+        self.doc_gauss_kernel_size = int(doc_gauss_kernel_size)
+        self.doc_gauss_sigma = float(doc_gauss_sigma)
+        self.doc_gauss_n_iter = int(doc_gauss_n_iter)
+        self.forward_output_is_logits = bool(forward_output_is_logits)
+ 
         # Load Proxy Forward Model
         print(f"[PhysicsLoss] Loading Frozen Forward Model from: {forward_checkpoint}")
         self.forward_model = ProxyForwardModel(ckpt_path=forward_checkpoint, device=torch.device(device))
@@ -43,6 +64,44 @@ class PhysicsInformedLoss(nn.Module):
         # Explicitly freeze parameters just in case
         for param in self.forward_model.parameters():
             param.requires_grad = False
+
+    # -----------------------------
+    # ✅ [NEW] DoC utils
+    # -----------------------------
+    @staticmethod
+    def _logit_safe(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        p = torch.clamp(p, eps, 1.0 - eps)
+        return torch.log(p) - torch.log(1.0 - p)
+
+    @staticmethod
+    def _gaussian_kernel2d(ks: int, sigma: float, device, dtype) -> torch.Tensor:
+        ks = int(ks)
+        sigma = float(sigma)
+        if ks % 2 == 0:
+            ks += 1  # enforce odd
+        ax = torch.arange(ks, device=device, dtype=dtype) - (ks - 1) / 2.0
+        xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+        kernel = torch.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma + 1e-12))
+        kernel = kernel / (kernel.sum() + 1e-12)
+        return kernel
+
+    def _apply_gaussian_blur(self, img_01: torch.Tensor) -> torch.Tensor:
+        """
+        img_01: (B,1,H,W) in [0,1]
+        """
+        if (not self.doc_gauss_enable) or (self.doc_gauss_sigma <= 0) or (self.doc_gauss_kernel_size <= 1):
+            return img_01
+        ks = int(self.doc_gauss_kernel_size)
+        if ks % 2 == 0:
+            ks += 1
+        k = self._gaussian_kernel2d(ks, self.doc_gauss_sigma, device=img_01.device, dtype=img_01.dtype)
+        w = k[None, None, :, :]  # (1,1,ks,ks)
+        pad = ks // 2
+        x = img_01
+        n_iter = max(1, int(self.doc_gauss_n_iter))
+        for _ in range(n_iter):
+            x = F.conv2d(x, w, bias=None, stride=1, padding=pad)
+        return x
 
     def _pixelize_constraint(self, mask_01: torch.Tensor) -> torch.Tensor:
         """
@@ -57,6 +116,23 @@ class PhysicsInformedLoss(nn.Module):
         
         return x_back
 
+    def _degree_of_cure(self, ld_logits: torch.Tensor) -> torch.Tensor:
+        """
+        ✅ DoC stage (optional): LD(logits) -> LD(prob) -> (Gaussian blur etc.) -> back to logits
+        Why return logits?
+        - To preserve existing LD->CI path via _soft_curing(ld_logits) without changing its behavior.
+        """
+        # logits -> prob [0,1]
+        ld_01 = torch.sigmoid(ld_logits)
+
+        # spatial spread / proximity as Gaussian convolution
+        ld_01 = self._apply_gaussian_blur(ld_01)
+
+        # stay valid range and return to logits domain
+        ld_01 = torch.clamp(ld_01, 0.0, 1.0)
+        ld_logits_doc = self._logit_safe(ld_01)
+        return ld_logits_doc
+ 
     def _soft_curing(self, ld_logits: torch.Tensor) -> torch.Tensor:
         """
         Differentiable piecewise-linear curing.
@@ -118,19 +194,30 @@ class PhysicsInformedLoss(nn.Module):
         # - ProxyForwardModel.forward() is decorated with no_grad for benchmark.
         # - For training, use forward_with_grad() to keep gradient to pred_pixelized.
         if hasattr(self.forward_model, "forward_with_grad"):
-            ld_logits = self.forward_model.forward_with_grad(pred_pixelized)
+            ld_out = self.forward_model.forward_with_grad(pred_pixelized)
         else:
             # fallback: direct call (may be no_grad if forward() is decorated)
-            ld_logits = self.forward_model.model(pred_pixelized.to(self.forward_model.device))
+            ld_out = self.forward_model.model(pred_pixelized.to(self.forward_model.device))
    
-        # 4. Differentiable Soft Curing (50~80 range)
+        # ✅ normalize forward output representation:
+        # - if forward outputs prob(0~1), convert to logits to keep soft_curing unchanged
+        if self.forward_output_is_logits:
+            ld_logits = ld_out
+        else:
+            ld_logits = self._logit_safe(torch.clamp(ld_out, 0.0, 1.0))
+ 
+        # 4. ✅ (Optional) DoC stage: LD -> DoC(LD) (still logits)
+        if self.doc_enable:
+            ld_logits = self._degree_of_cure(ld_logits)
+
+        # 5. Differentiable Soft Curing (keep as-is)
         cured_img = self._soft_curing(ld_logits)
-        
+          
         # safety: ensure target is same spatial size as cured_img
         if target_mask.shape[-2:] != cured_img.shape[-2:]:
             target_mask = F.interpolate(target_mask, size=cured_img.shape[-2:], mode="nearest")
 
-        # 5. Compute Loss (L1)
+        # 6. Compute Loss (L1)
         #    Compare the "Simulated Cured Result" with the "Desired Target"
         loss = F.l1_loss(cured_img, target_mask)
         

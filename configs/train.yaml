@@ -4,7 +4,7 @@ defaults:
   - _self_
 
   # ✅ DLP task 선택 (inverse부터)
-  - task: inverse_physics_binary
+  - task: inverse_1_gray
 
   # ✅ DLP 모델/데이터/로스는 새 그룹으로 분리
   # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)
@@ -34,7 +34,7 @@ report_interval: 50000
 seed: 430
 num_workers: 8
 
-exp_name: dlp_inverse_thr2mask_baseline
+exp_name: dlp_inverse_forwardLoss
 
 # ✅ [New] Evaluation / Benchmark Config
 evaluation:
@@ -47,7 +47,7 @@ evaluation:
       apply_sigmoid: true   # ✅ forward output이 logits면 true
     inverse_post:
       apply_sigmoid: true     # logits -> sigmoid(prob) 적용 여부
-      binarize: true          # prob(or raw) -> binary mask 적용 여부
+      binarize: false          # prob(or raw) -> binary mask 적용 여부
       binarize_thr: 0.5       # binarize threshold (0~1)
     curing:
       threshold: 0.23529         # curing depth threshold (0~1, 60/255)
@@ -59,6 +59,14 @@ evaluation:
       upsample: "nearest"
       apply_to: "corr"   # "both" | "naive" | "corr"
 
+    # ✅ [NEW] Evaluation DoC stage toggle (LD->CI vs LD->DoC->CI)
+    doc:
+      enable: true
+      gauss:
+        enable: true
+        kernel_size: 11
+        sigma: 10
+        n_iter: 1
 
 # ✅ DLP image I/O 공통 옵션 (Dataset/Transform에서 사용)
 image:

@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from utils.evaluation.benchmark_dataset import BenchmarkDataset
 from utils.evaluation.proxy_forward import ProxyForwardModel
 import torch.nn.functional as F
+import math
 
 
 class BenchmarkReporter:
@@ -38,6 +39,13 @@ class BenchmarkReporter:
         mask_pixelize_downsample: str = "mean",   # "mean"(area/avg) | "nearest"
         mask_pixelize_upsample: str = "nearest",  # "nearest" | "bilinear"
         mask_pixelize_apply_to: str = "both",     # "both" | "naive" | "corr"
+
+        # ✅ [NEW] DoC options (eval-only)
+        doc_enable: bool = False,
+        doc_gauss_enable: bool = True,
+        doc_gauss_kernel_size: int = 51,
+        doc_gauss_sigma: float = 12.0,
+        doc_gauss_n_iter: int = 1,
     ):
         self.inverse_model = inverse_model
         self.forward_model = forward_model
@@ -61,6 +69,55 @@ class BenchmarkReporter:
         self.mp_down = str(mask_pixelize_downsample).lower()
         self.mp_up = str(mask_pixelize_upsample).lower()
         self.mp_apply_to = str(mask_pixelize_apply_to).lower()
+
+        self.doc_enable = bool(doc_enable)
+        self.doc_gauss_enable = bool(doc_gauss_enable)
+        self.doc_gauss_kernel_size = int(doc_gauss_kernel_size)
+        self.doc_gauss_sigma = float(doc_gauss_sigma)
+        self.doc_gauss_n_iter = int(doc_gauss_n_iter)
+
+    @staticmethod
+    def _logit_safe(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        p = torch.clamp(p, eps, 1.0 - eps)
+        return torch.log(p) - torch.log(1.0 - p)
+
+    @staticmethod
+    def _gaussian_kernel2d(ks: int, sigma: float, device, dtype) -> torch.Tensor:
+        ks = int(ks)
+        if ks % 2 == 0:
+            ks += 1
+        ax = torch.arange(ks, device=device, dtype=dtype) - (ks - 1) / 2.0
+        xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+        kernel = torch.exp(-(xx * xx + yy * yy) / (2.0 * float(sigma) * float(sigma) + 1e-12))
+        kernel = kernel / (kernel.sum() + 1e-12)
+        return kernel
+
+    def _apply_gaussian_blur(self, img_01: torch.Tensor) -> torch.Tensor:
+        if (not self.doc_gauss_enable) or (self.doc_gauss_sigma <= 0) or (self.doc_gauss_kernel_size <= 1):
+            return img_01
+        ks = int(self.doc_gauss_kernel_size)
+        if ks % 2 == 0:
+            ks += 1
+        k = self._gaussian_kernel2d(ks, self.doc_gauss_sigma, device=img_01.device, dtype=img_01.dtype)
+        w = k[None, None, :, :]
+        pad = ks // 2
+        x = img_01
+        for _ in range(max(1, int(self.doc_gauss_n_iter))):
+            x = F.conv2d(x, w, bias=None, stride=1, padding=pad)
+        return x
+
+    def _apply_doc_to_ld_logits(self, ld_logits: torch.Tensor) -> torch.Tensor:
+        """
+        LD(logits) -> LD(prob) -> blur -> back to logits
+        (soft_curing이 logits->sigmoid를 기대하는 구조를 최대한 유지하려고 logits로 복귀)
+        """
+        # ✅ forward output policy:
+        # - fwd_apply_sigmoid=True  => ld_logits is logits -> sigmoid
+        # - fwd_apply_sigmoid=False => ld_logits is already prob(0~1)
+        ld_01 = torch.sigmoid(ld_logits) if self.fwd_apply_sigmoid else ld_logits
+        ld_01 = self._apply_gaussian_blur(ld_01)
+        ld_01 = torch.clamp(ld_01, 0.0, 1.0)
+        return self._logit_safe(ld_01)
 
     # ---------------------------------------------------------------------
     # ✅ Metrics helpers
@@ -165,7 +222,15 @@ class BenchmarkReporter:
         If curing_binarize: threshold -> {0,1}
         Else: return ld as-is (0~1 expected).
         """
-        ld = self._postprocess_forward(ld)   # ✅ curing 전에 정규화
+        # 1) LD를 0~1로 정규화 (logits이면 sigmoid, 아니면 그대로)
+        ld = self._postprocess_forward(ld)
+
+        # 2) ✅ (Optional) DoC stage: LD -> DoC(LD) in 0~1 domain
+        #    LD->CI vs LD->DoC->CI 를 yaml로 토글 가능하게.
+        if self.doc_enable:
+            ld = self._apply_gaussian_blur(ld)
+            ld = torch.clamp(ld, 0.0, 1.0)
+
         if self.curing_binarize:
             return (ld >= self.curing_thr).float()
         return ld

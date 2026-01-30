@@ -3,6 +3,7 @@
 _target_: utils.common.physics_loss.PhysicsInformedLoss
 
 forward_checkpoint: ${evaluation.benchmark.proxy_checkpoint}
+forward_output_is_logits: true
 
 grid_size: 160
 infer_size: 640
@@ -12,3 +13,10 @@ cure_thr_low: 50.0
 cure_thr_high: 80.0
 
 device: cuda
+
+# ✅ DoC (LD->(DoC)->CI에서 DoC만 on/off)
+doc_enable: true
+doc_gauss_enable: true
+doc_gauss_kernel_size: 11
+doc_gauss_sigma: 10
+doc_gauss_n_iter: 1

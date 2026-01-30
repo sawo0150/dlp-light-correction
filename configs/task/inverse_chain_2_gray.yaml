@@ -1,0 +1,67 @@
+# configs/task/inverse_chain_2_gray.yaml
+name: inverse_chain_2_gray
+
+inverse:
+  input_source: "thr_random"          # ["thr_random", "thr_fixed", "ld_1280_aligned"]
+  thr_random_policy: "expand_all"
+  thr_fixed_values: []
+  thr_stack: false
+
+  # ✅ targets
+  target_mask_key: "mask_160"
+  target_ld_key: "ld_1280_aligned"
+
+  preprocess:
+    out_size: 640
+
+  data:
+    modes: ["binary","gray"]
+    split_source: "manifest"
+    dataset_allow: []
+    domain:
+      enable: false
+      weights: { B1: 1.0, B2: 0.0, B3: 0.0, B4: 0.0, B5: 0.0 }
+    max_samples: { train: 0, val: 0, test: 0 }
+    max_samples_unit: "items"
+    resample_each_epoch: false
+    with_replacement: false
+    debug: { enable: true, examples: 5 }
+
+  # ✅ chain pipeline config
+  pipeline:
+    enable: true
+    stages: ["thr2ld", "ld2mask"]   # ✅ baseline-2
+
+    # ✅ stage별 입력 정책 (GT vs pred_detach)
+    # - baseline 재현(사수님 스타일): gt 권장
+    # - 나중에 pipeline consistency 넣고 싶으면 pred_detach로 스위치
+    input_policy:
+      ld2mask: "gt"     # ["gt", "pred_detach"]
+      # (doc 쓰면) doc2mask도 같은 방식
+
+    # ✅ epoch 스케줄로 gt -> pred_detach 전환 가능 (선택)
+    schedule:
+      enable: false
+      switch_epoch: 2   # epoch>=2면 pred_detach로
+      ld2mask_after: "pred_detach"
+
+    # ✅ stage별 모델/옵티마이저/로스
+    # (가장 모듈적인 방식: 기존 model/optimizer 그룹을 “복제해서” 사용)
+    models:
+      thr2ld: ${model}        # train.yaml의 model: unet_small 재사용
+      ld2mask: ${model}
+
+    optimizers:
+      thr2ld: ${optimizer}
+      ld2mask: ${optimizer}
+
+    losses:
+      thr2ld:
+        _target_: utils.common.loss_function.SigmoidL1Loss
+      ld2mask: ${LossFunction}   # 기존 BCEWithLogitsL1Loss 등 재사용
+
+    # ✅ (옵션) gradient clip을 stage별로도 제어 가능(안 쓰면 train.yaml 공통 사용)
+    grad_clip:
+      enable: false
+      max_norm: 1.0
+      norm_type: 2
