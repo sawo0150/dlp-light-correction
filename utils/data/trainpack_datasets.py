@@ -175,6 +175,136 @@ class InverseThr2MaskDataset(Dataset):
         }
         return to_chw_torch(x), to_chw_torch(y), meta
 
+class InverseThr2LDMaskDataset(Dataset):
+    """
+    inverse chain baseline:
+      x: thr_random | thr_fixed
+      y: dict {"ld": ld_1280_aligned, "mask": mask_{128|160|1280}}
+    """
+    def __init__(
+        self,
+        *,
+        root: Path,
+        rows: List[TrainPackRow],
+        task_cfg: Dict,
+        image_cfg: CommonImageConfig,
+        thr_index_path: Optional[Path] = None,
+        is_train: bool = True,
+        seed: int = 1234,
+    ):
+        self.root = Path(root)
+        self.rows = rows
+        self.task_cfg = task_cfg or {}
+        self.image_cfg = image_cfg
+        self.is_train = bool(is_train)
+        self.rng = random.Random(int(seed))
+
+        inv = (self.task_cfg.get("inverse") or {})
+        self.input_source = inv.get("input_source", "thr_random")
+        self.thr_random_policy = inv.get("thr_random_policy", "expand_all")
+        self.thr_fixed_values = list(inv.get("thr_fixed_values", []) or [])
+
+        self.target_mask_key = (inv.get("target_mask_key", "mask_160") or "mask_160")
+        self.target_ld_key   = (inv.get("target_ld_key", "ld_1280_aligned") or "ld_1280_aligned")
+        pre = (inv.get("preprocess") or {})
+        self.out_size = int(pre.get("out_size", self.image_cfg.size))
+
+        # thr index
+        self.thr_index: Dict[str, List[str]] = {}
+        if self.input_source == "thr_random" and thr_index_path is not None and Path(thr_index_path).exists():
+            self.thr_index = load_thr_file_index(Path(thr_index_path))
+
+        self.items: List[Dict] = self._build_items()
+        if len(self.items) == 0:
+            raise RuntimeError("No samples after building inverse chain dataset items.")
+
+    def _resolve_mask_path(self, r: TrainPackRow) -> Path:
+        if self.target_mask_key == "mask_128":
+            return self.root / r.mask_128_path
+        if self.target_mask_key == "mask_1280":
+            return self.root / r.mask_1280_path
+        return self.root / r.mask_160_path
+
+    def _resolve_ld_path(self, r: TrainPackRow) -> Path:
+        # 현재 trainpack에는 ld_1280_aligned만 있다고 가정
+        return self.root / r.ld_1280_aligned_path
+
+    def _build_items(self) -> List[Dict]:
+        items: List[Dict] = []
+        for r in self.rows:
+            y_mask = self._resolve_mask_path(r)
+            y_ld   = self._resolve_ld_path(r)
+
+            if self.input_source == "thr_fixed":
+                x_path = pick_thr_fixed_file(self.root, r.thr_fixed_map_json, self.thr_fixed_values)
+                if x_path is not None:
+                    items.append({"row": r, "x_path": x_path, "y_mask": y_mask, "y_ld": y_ld})
+                continue
+
+            # thr_random
+            rel_paths = self.thr_index.get(r.sample_key, [])
+            if not rel_paths:
+                continue
+            thr_files = [self.root / p for p in rel_paths]
+
+            if self.thr_random_policy == "random_one":
+                items.append({"row": r, "x_paths": thr_files, "y_mask": y_mask, "y_ld": y_ld})
+            else:
+                for p in thr_files:
+                    items.append({"row": r, "x_path": p, "y_mask": y_mask, "y_ld": y_ld})
+        return items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _get_x_path(self, item: Dict) -> Path:
+        if "x_path" in item:
+            return item["x_path"]
+        paths: List[Path] = item["x_paths"]
+        if self.is_train:
+            return paths[self.rng.randrange(0, len(paths))]
+        return paths[0]
+
+    def __getitem__(self, idx: int):
+        item = self.items[idx]
+        r: TrainPackRow = item["row"]
+
+        x_path = self._get_x_path(item)
+        y_mask_path = item["y_mask"]
+        y_ld_path   = item["y_ld"]
+
+        x_u8      = read_gray_u8(x_path)         # thr
+        y_mask_u8 = read_gray_u8(y_mask_path)    # mask GT
+        y_ld_u8   = read_gray_u8(y_ld_path)      # ld GT (aligned)
+
+        # resize: thr/ld continuous -> is_mask=False (AREA), mask -> is_mask=True (NEAREST)
+        x_u8      = resize_u8(x_u8,      self.out_size, is_mask=False)
+        y_ld_u8   = resize_u8(y_ld_u8,   self.out_size, is_mask=False)
+        y_mask_u8 = resize_u8(y_mask_u8, self.out_size, is_mask=True)
+
+        x      = u8_to_float(x_u8, self.image_cfg.normalize)
+        y_ld   = u8_to_float(y_ld_u8, self.image_cfg.normalize)
+        y_mask = u8_to_float(y_mask_u8, self.image_cfg.normalize)
+        if self.image_cfg.binarize_target:
+            y_mask = binarize01(y_mask, 0.5)
+
+        meta = {
+            "sample_key": r.sample_key,
+            "dataset": r.dataset,
+            "mode": r.mode,
+            "x_path": str(x_path),
+            "y_mask_path": str(y_mask_path),
+            "y_ld_path": str(y_ld_path),
+            "input_source": self.input_source,
+            "out_size": self.out_size,
+        }
+
+        # ✅ y를 dict로 리턴 (train_epoch_chain이 처리)
+        y = {
+            "mask": to_chw_torch(y_mask),
+            "ld":   to_chw_torch(y_ld),
+        }
+        return to_chw_torch(x), y, meta
 
 class ForwardMask2LDDataset(Dataset):
     """

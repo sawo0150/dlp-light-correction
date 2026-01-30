@@ -16,6 +16,7 @@ from utils.data.trainpack_manifest import TrainPackManifest
 from utils.data.trainpack_datasets import (
     CommonImageConfig,
     InverseThr2MaskDataset,
+    InverseThr2LDMaskDataset,
     ForwardMask2LDDataset,
 )
 
@@ -163,6 +164,13 @@ def create_data_loaders(args, split: str, shuffle: bool, is_train: bool) -> Data
         elif input_source == "mask_target":
             # ✅ target mask만 있으면 되므로 require_flags 강제 없음
             pass
+
+        # ✅ NEW: pipeline(chain) mode면 LD GT가 필요하므로 has_fwd도 강제
+        inv_cfg = (task_cfg.get("inverse") or {})
+        pipe_cfg = (inv_cfg.get("pipeline") or {})
+        pipe_enable = bool(pipe_cfg.get("enable", False))
+        if pipe_enable:
+            require_flags["has_fwd"] = 1
 
     if task_name.startswith("forward"):
         require_flags["has_fwd"] = 1

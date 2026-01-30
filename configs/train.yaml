@@ -4,7 +4,7 @@ defaults:
   - _self_
 
   # ✅ DLP task 선택 (inverse부터)
-  - task: inverse_1_gray
+  - task: inverse_chain_2_gray
 
   # ✅ DLP 모델/데이터/로스는 새 그룹으로 분리
   # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)

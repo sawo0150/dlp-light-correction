@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from utils.data.dataloader_factory import create_data_loaders
 from utils.logging.wandb_logger import WandbLogger
 from utils.common.utils import compute_segmentation_metrics, compute_regression_metrics
+from utils.common.utils import _get_pipe_cfg, _apply_stage_input_policy, _gaussian_kernel2d, _blur_01, _make_doc_pseudo
 from utils.evaluation.benchmark_dataset import BenchmarkDataset
 from utils.evaluation.proxy_forward import ProxyForwardModel
 from utils.evaluation.reporter import BenchmarkReporter
@@ -276,6 +277,217 @@ def validate(args, model, data_loader, epoch, loss_fn):
 
     return metric_loss, metric_m1, metric_m2, metric_m3, time.perf_counter() - start
 
+def train_epoch_chain(
+    *,
+    args,
+    epoch: int,
+    models: Dict[str, nn.Module],
+    data_loader,
+    opts: Dict[str, torch.optim.Optimizer],
+    losses: Dict[str, nn.Module],
+    scaler: GradScaler,
+    amp_enabled: bool,
+    accum_steps: int,
+    logger: WandbLogger,
+    global_iter_start: int = 0,
+):
+    pipe_cfg = _get_pipe_cfg(args)
+    stages = list(pipe_cfg.get("stages", []) or [])
+    ipol = dict(pipe_cfg.get("input_policy", {}) or {})
+    sched = dict(pipe_cfg.get("schedule", {}) or {})
+    sched_enable = bool(sched.get("enable", False))
+    switch_epoch = int(sched.get("switch_epoch", 10**9))
+
+    # doc pseudo (for chain3)
+    doc_pseudo_cfg = dict(pipe_cfg.get("doc_pseudo", {}) or {})
+
+    for s in stages:
+        models[s].train()
+    torch.cuda.reset_peak_memory_stats()
+
+    len_loader = len(data_loader)
+    total_loss = 0.0
+    start_iter = time.perf_counter()
+
+    pbar = tqdm(enumerate(data_loader),
+                total=len_loader,
+                dynamic_ncols=True,
+                leave=False,
+                desc=f"Epoch[{epoch:2d}/{args.num_epochs}]/CHAIN")
+
+    for it, data in pbar:
+        x, y, meta = data
+        x = x.cuda(non_blocking=True)              # thr
+        # y is dict: {"ld":..., "mask":...}
+        ld_gt = y["ld"].cuda(non_blocking=True)
+        mask_gt = y["mask"].cuda(non_blocking=True)
+
+        # accum boundary: zero_grad once
+        if it % accum_steps == 0:
+            for s in stages:
+                opts[s].zero_grad(set_to_none=True)
+
+        # -----------------------------
+        # stage 1) thr2ld
+        # -----------------------------
+        with autocast(enabled=amp_enabled):
+            ld_logits = models["thr2ld"](x)
+            loss_ld = losses["thr2ld"](ld_logits, ld_gt) / accum_steps
+        scaler.scale(loss_ld).backward()
+
+        # -----------------------------
+        # stage 2) ld2doc (optional)
+        # -----------------------------
+        doc_logits = None
+        doc_gt = None
+        if "ld2doc" in stages:
+            pol = ipol.get("ld2doc", "gt")
+            if sched_enable and epoch >= switch_epoch:
+                pol = str(sched.get("ld2doc_after", pol))
+            ld_in = _apply_stage_input_policy(pol, gt=ld_gt, pred_logits=ld_logits)
+
+            doc_gt = _make_doc_pseudo(ld_gt, doc_pseudo_cfg) if bool(doc_pseudo_cfg.get("enable", True)) else ld_gt
+            with autocast(enabled=amp_enabled):
+                doc_logits = models["ld2doc"](ld_in)
+                loss_doc = losses["ld2doc"](doc_logits, doc_gt) / accum_steps
+            scaler.scale(loss_doc).backward()
+        else:
+            loss_doc = torch.tensor(0.0, device=x.device)
+
+        # -----------------------------
+        # stage 3) ld2mask OR doc2mask
+        # -----------------------------
+        if "doc2mask" in stages:
+            pol = ipol.get("doc2mask", "gt")
+            if sched_enable and epoch >= switch_epoch:
+               pol = str(sched.get("doc2mask_after", pol))
+            # doc input: gt or pred_detach
+            assert doc_logits is not None, "doc2mask stage requires ld2doc stage"
+            doc_in = _apply_stage_input_policy(pol, gt=doc_gt, pred_logits=doc_logits)
+            with autocast(enabled=amp_enabled):
+                mask_logits = models["doc2mask"](doc_in)
+                loss_mask = losses["doc2mask"](mask_logits, mask_gt) / accum_steps
+            scaler.scale(loss_mask).backward()
+        else:
+            pol = ipol.get("ld2mask", "gt")
+            if sched_enable and epoch >= switch_epoch:
+                pol = str(sched.get("ld2mask_after", pol))
+            ld_in = _apply_stage_input_policy(pol, gt=ld_gt, pred_logits=ld_logits)
+            with autocast(enabled=amp_enabled):
+                mask_logits = models["ld2mask"](ld_in)
+                loss_mask = losses["ld2mask"](mask_logits, mask_gt) / accum_steps
+            scaler.scale(loss_mask).backward()
+
+        # -----------------------------
+        # step at boundary (single update timing)
+        # -----------------------------
+        if (it + 1) % accum_steps == 0 or (it + 1) == len_loader:
+            # unscale + optional clip per stage
+            grad_clip_cfg = dict(pipe_cfg.get("grad_clip", {}) or {})
+            clip_enable = bool(grad_clip_cfg.get("enable", False)) or bool(getattr(args, "training_grad_clip_enable", False))
+            clip_max = float(grad_clip_cfg.get("max_norm", getattr(args, "training_grad_clip_max_norm", 1.0)))
+            clip_t = int(grad_clip_cfg.get("norm_type", getattr(args, "training_grad_clip_norm_type", 2)))
+
+            for s in stages:
+                scaler.unscale_(opts[s])
+                if clip_enable:
+                    clip_grad_norm_(models[s].parameters(), clip_max, norm_type=clip_t)
+
+            for s in stages:
+                scaler.step(opts[s])
+            scaler.update()
+
+            for s in stages:
+                opts[s].zero_grad(set_to_none=True)
+
+        # logging (대표 loss는 mask)
+        total_loss += float(loss_mask.detach().item()) * accum_steps
+        dice, iou = compute_segmentation_metrics(mask_logits.detach(), mask_gt.detach())
+        pbar.set_postfix_str(
+            f"mask {total_loss/(it+1):.4g} | ld {float(loss_ld.detach().item()*accum_steps):.3g} | D {dice:.3f} | I {iou:.3f}"
+        )
+
+        # wandb (추가 scalar)
+        if logger.enabled:
+            wb_cfg = getattr(args, "wandb", {}) if hasattr(args, "wandb") else {}
+            log_every = int(wb_cfg.get("log_every_n_iters", 0) or 0) if isinstance(wb_cfg, dict) else 0
+            if log_every and (it > 0) and (it % log_every == 0) and wandb is not None and wandb.run is not None:
+                wandb.log({
+                    "train_chain/loss_mask": float(loss_mask.detach().item()*accum_steps),
+                    "train_chain/loss_ld": float(loss_ld.detach().item()*accum_steps),
+                    "train_chain/loss_doc": float(loss_doc.detach().item()*accum_steps) if isinstance(loss_doc, torch.Tensor) else float(loss_doc),
+                    "train_chain/dice": float(dice),
+                    "train_chain/iou": float(iou),
+                }, step=global_iter_start + it)
+
+        torch.cuda.empty_cache()
+
+    return total_loss / max(1, len_loader), time.perf_counter() - start_iter
+
+
+def validate_chain(*, args, epoch: int, models: Dict[str, nn.Module], data_loader, losses: Dict[str, nn.Module], amp_enabled: bool):
+    pipe_cfg = _get_pipe_cfg(args)
+    stages = list(pipe_cfg.get("stages", []) or [])
+    ipol = dict(pipe_cfg.get("input_policy", {}) or {})
+    doc_pseudo_cfg = dict(pipe_cfg.get("doc_pseudo", {}) or {})
+
+    for s in stages:
+        models[s].eval()
+
+    total_mask = 0.0
+    total_ld = 0.0
+    total_doc = 0.0
+    total_dice = 0.0
+    total_iou = 0.0
+    n = 0
+    start = time.perf_counter()
+
+    with torch.no_grad():
+        for x, y, meta in data_loader:
+            x = x.cuda(non_blocking=True)
+            ld_gt = y["ld"].cuda(non_blocking=True)
+            mask_gt = y["mask"].cuda(non_blocking=True)
+
+            with autocast(enabled=amp_enabled):
+                ld_logits = models["thr2ld"](x)
+                loss_ld = losses["thr2ld"](ld_logits, ld_gt)
+
+                doc_logits = None
+                doc_gt = None
+                if "ld2doc" in stages:
+                    ld_in = _apply_stage_input_policy(ipol.get("ld2doc", "gt"), gt=ld_gt, pred_logits=ld_logits)
+                    doc_gt = _make_doc_pseudo(ld_gt, doc_pseudo_cfg) if bool(doc_pseudo_cfg.get("enable", True)) else ld_gt
+                    doc_logits = models["ld2doc"](ld_in)
+                    loss_doc = losses["ld2doc"](doc_logits, doc_gt)
+                else:
+                    loss_doc = torch.tensor(0.0, device=x.device)
+
+                if "doc2mask" in stages:
+                    doc_in = _apply_stage_input_policy(ipol.get("doc2mask", "gt"), gt=doc_gt, pred_logits=doc_logits)
+                    mask_logits = models["doc2mask"](doc_in)
+                    loss_mask = losses["doc2mask"](mask_logits, mask_gt)
+                else:
+                    ld_in = _apply_stage_input_policy(ipol.get("ld2mask", "gt"), gt=ld_gt, pred_logits=ld_logits)
+                    mask_logits = models["ld2mask"](ld_in)
+                    loss_mask = losses["ld2mask"](mask_logits, mask_gt)
+
+            dice, iou = compute_segmentation_metrics(mask_logits, mask_gt)
+            total_mask += float(loss_mask.item())
+            total_ld += float(loss_ld.item())
+            total_doc += float(loss_doc.item()) if isinstance(loss_doc, torch.Tensor) else float(loss_doc)
+            total_dice += float(dice)
+            total_iou += float(iou)
+            n += 1
+
+    # 반환 포맷은 기존 validate와 맞춤:
+    # metric_loss, metric_m1, metric_m2, metric_m3, time
+    # 여기서 metric_loss는 mask loss 중심으로 두고, m1/m2는 dice/iou
+    metric_loss = total_mask / max(1, n)
+    metric_m1 = total_dice / max(1, n)
+    metric_m2 = total_iou / max(1, n)
+    metric_m3 = 0.0
+    return metric_loss, metric_m1, metric_m2, metric_m3, time.perf_counter() - start
+
 
 def save_model(args, exp_dir, epoch, model, optimizer, best_val_loss, is_new_best):
     
@@ -349,12 +561,44 @@ def train(args):
 
     # instantiate(cfg.model) 로 모든 모델 파라미터 주입,
     # use_checkpoint 은 training.checkpointing 에 따름
-    model_cfg = getattr(args, "model")
-    model = instantiate(OmegaConf.create(model_cfg))
-    model.to(device)
+    task_cfg = getattr(args, "task", {}) or {}
+    inv_cfg  = (task_cfg.get("inverse") or {}) if isinstance(task_cfg, dict) else {}
+    pipe_cfg = dict(inv_cfg.get("pipeline", {}) or {})
+    pipe_enable = bool(pipe_cfg.get("enable", False))
 
-    loss_cfg = getattr(args, "LossFunction")
-    loss_fn = instantiate(OmegaConf.create(loss_cfg)).to(device=device)
+    if not pipe_enable:
+        model_cfg = getattr(args, "model")
+        model = instantiate(OmegaConf.create(model_cfg))
+        model.to(device)
+
+        loss_cfg = getattr(args, "LossFunction")
+        loss_fn = instantiate(OmegaConf.create(loss_cfg)).to(device=device)
+    else:
+        # ✅ pipeline: stage별 모델/옵티마이저/로스 생성
+        stages = list(pipe_cfg.get("stages", []) or [])
+        if not stages:
+            raise ValueError("pipeline.enable=true but pipeline.stages is empty.")
+
+        models_cfg = dict(pipe_cfg.get("models", {}) or {})
+        opts_cfg   = dict(pipe_cfg.get("optimizers", {}) or {})
+        losses_cfg = dict(pipe_cfg.get("losses", {}) or {})
+
+        models = {}
+        opts = {}
+        losses = {}
+
+        for s in stages:
+            if s not in models_cfg:
+                raise KeyError(f"pipeline.models missing stage '{s}'")
+            models[s] = instantiate(OmegaConf.create(models_cfg[s])).to(device)
+
+            if s not in opts_cfg:
+                raise KeyError(f"pipeline.optimizers missing stage '{s}'")
+            opts[s] = instantiate(OmegaConf.create(opts_cfg[s]), params=models[s].parameters())
+
+            if s not in losses_cfg:
+                raise KeyError(f"pipeline.losses missing stage '{s}'")
+            losses[s] = instantiate(OmegaConf.create(losses_cfg[s])).to(device=device)
 
     # ✅ avoid gigantic repr (ProxyForwardModel / Unet dump)
     msg = f"[Hydra] loss_func ▶ {loss_fn.__class__.__name__}"
@@ -368,18 +612,22 @@ def train(args):
     # ✅ [FIX] Optimizer 초기화 (UnboundLocalError 해결)
     # 스케줄러 생성 전에 반드시 Optimizer가 있어야 합니다.
     # ──────────────────────────────────────────────────────────────────────────
-    optim_cfg = getattr(args, "optimizer")
-    # Hydra instantiate로 생성 (params 인자로 모델 파라미터 전달)
-    optimizer = instantiate(OmegaConf.create(optim_cfg), params=model.parameters())
-    print(f"[Hydra] optimizer ▶ {optimizer.__class__.__name__}")
+    if not pipe_enable:
+        optim_cfg = getattr(args, "optimizer")
+        optimizer = instantiate(OmegaConf.create(optim_cfg), params=model.parameters())
+        print(f"[Hydra] optimizer ▶ {optimizer.__class__.__name__}")
+    else:
+        optimizer = None
+        print(f"[Hydra] pipeline optimizers ▶ {list(opts.keys())}")
 
     # ──────────────── LR Scheduler (옵션) ────────────────
     # [수정] DeepSpeed 분기 제거하고 바로 Scheduler 생성 로직 수행
     
     # 0) Config → OmegaConf
+    # 스케줄러 생성 (pipeline에서는 일단 OFF 권장: stage별로 분리 필요)
     sched_cfg_raw = getattr(args, "LRscheduler", None)
     scheduler = None
-    if sched_cfg_raw is not None:
+    if (not pipe_enable) and (sched_cfg_raw is not None):
         sched_cfg = OmegaConf.create(sched_cfg_raw)   # dict → OmegaConf
 
         print("[Info] Skip calculating exact effective_steps to save time.")
@@ -592,16 +840,42 @@ def train(args):
             print(f"[GradAccum] Epoch {epoch}: accum_steps {accum_steps} → {accum_steps_epoch}")
             accum_steps = accum_steps_epoch
 
-        train_loss, train_time = train_epoch(
-            args, epoch, model, train_loader, optimizer, scheduler,
-            loss_fn, scaler, amp_enabled, accum_steps,
-            logger=logger,
-            global_iter_start=global_iter
-         )
+        if not pipe_enable:
+            train_loss, train_time = train_epoch(
+                args, epoch, model, train_loader, optimizer, scheduler,
+                loss_fn, scaler, amp_enabled, accum_steps,
+                logger=logger,
+                global_iter_start=global_iter
+            )
+        else:
+            train_loss, train_time = train_epoch_chain(
+                args=args,
+                epoch=epoch,
+                models=models,
+                data_loader=train_loader,
+                opts=opts,
+                losses=losses,
+                scaler=scaler,
+                amp_enabled=amp_enabled,
+                accum_steps=accum_steps,
+                logger=logger,
+                global_iter_start=global_iter,
+            )
+
         global_iter += len(train_loader)    # ✅ 이 시점의 global_iter가 "epoch 끝 step"
         
-        val_loss, val_m1, val_m2, val_m3, val_time = validate(args, model, val_loader, epoch, loss_fn)
-
+        if not pipe_enable:
+            val_loss, val_m1, val_m2, val_m3, val_time = validate(args, model, val_loader, epoch, loss_fn)
+        else:
+            val_loss, val_m1, val_m2, val_m3, val_time = validate_chain(
+                args=args,
+                epoch=epoch,
+                models=models,
+                data_loader=val_loader,
+                losses=losses,
+                amp_enabled=amp_enabled,
+            )
+ 
         # ✨ val_loss 기록 (스케줄러 및 체크포인트용)
         val_loss_history.append(val_loss)
 

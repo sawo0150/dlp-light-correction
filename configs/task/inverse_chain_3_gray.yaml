@@ -1,0 +1,57 @@
+# configs/task/inverse_chain_3_gray.yaml
+name: inverse_chain_3_gray
+
+inverse:
+  input_source: "thr_random"
+  thr_random_policy: "expand_all"
+  thr_fixed_values: []
+  thr_stack: false
+
+  target_mask_key: "mask_160"
+  target_ld_key: "ld_1280_aligned"
+
+  preprocess:
+    out_size: 640
+
+  data: ${task.inverse.data}   # (원하면 위 yaml 그대로 복사해도 됨)
+
+  pipeline:
+    enable: true
+    stages: ["thr2ld", "ld2doc", "doc2mask"]
+
+    input_policy:
+      ld2doc: "gt"       # ["gt", "pred_detach"]
+      doc2mask: "gt"     # ["gt", "pred_detach"]
+
+    schedule:
+      enable: false
+      switch_epoch: 2
+      ld2doc_after: "pred_detach"
+      doc2mask_after: "pred_detach"
+
+    models:
+      thr2ld: ${model}
+      ld2doc: ${model}
+      doc2mask: ${model}
+
+    optimizers:
+      thr2ld: ${optimizer}
+      ld2doc: ${optimizer}
+      doc2mask: ${optimizer}
+
+    losses:
+      thr2ld:
+        _target_: utils.common.loss_function.SigmoidL1Loss
+      ld2doc:
+        _target_: utils.common.loss_function.SigmoidL1Loss   # doc도 0~1 regression으로 두면 깔끔
+      doc2mask: ${LossFunction}
+
+    # ✅ pseudo DoC 생성 규칙 (ld_gt -> doc_gt)
+    doc_pseudo:
+      enable: true
+      # ld(prob) -> blur -> (optional threshold/soft)
+      gauss:
+        enable: true
+        kernel_size: 11
+        sigma: 10
+        n_iter: 1
