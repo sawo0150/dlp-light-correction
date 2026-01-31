@@ -201,6 +201,20 @@ class WandbLogger:
 
         for x, y, meta in loader:
             x = x.to(device, non_blocking=True)
+            # ✅ pipeline dataset: y can be dict (e.g., {"ld":..., "mask":...})
+            #    For inverse visualization, we want the mask target by default.
+            if isinstance(y, dict):
+                if "mask" in y:
+                    y = y["mask"]
+                else:
+                    # fallback: pick first tensor value
+                    # (keeps compatibility with other dict-shaped targets)
+                    for v in y.values():
+                        y = v
+                        break
+            # also handle list/tuple targets defensively
+            if isinstance(y, (list, tuple)):
+                y = y[0]
             y = y.to(device, non_blocking=True)
 
             logits = model(x)

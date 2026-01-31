@@ -10,6 +10,9 @@ import random, math
 import os
 from typing import Dict, Any, List, Optional
 
+import torch
+import torch.nn as nn
+
 def seed_fix(n):
     torch.manual_seed(n)
     torch.cuda.manual_seed(n)
@@ -103,3 +106,23 @@ def _make_doc_pseudo(ld_gt_01: torch.Tensor, doc_cfg: Dict[str, Any]) -> torch.T
         n_iter = int(g.get("n_iter", 1))
         ld_gt_01 = _blur_01(ld_gt_01, ks=ks, sigma=sigma, n_iter=n_iter)
     return torch.clamp(ld_gt_01, 0.0, 1.0)
+
+class _StageSequentialWrapper(nn.Module):
+    """
+    Pipeline(stage dict) -> single nn.Module wrapper for inference.
+    - For benchmark/eval: always run with predicted outputs (no teacher forcing).
+    - Assumes stage I/O is sequential: out(stage_i) -> in(stage_{i+1})
+      (thr2ld -> ld2doc -> doc2mask, or thr2ld -> ld2mask, etc.)
+    """
+    def __init__(self, models: Dict[str, nn.Module], stages: List[str]):
+        super().__init__()
+        # keep deterministic order
+        self.stages = list(stages)
+        # ModuleDict for proper .eval(), .to(), state_dict recursion
+        self.models = nn.ModuleDict({s: models[s] for s in self.stages})
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x
+        for s in self.stages:
+            h = self.models[s](h)
+        return h

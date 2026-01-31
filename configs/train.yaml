@@ -4,13 +4,13 @@ defaults:
   - _self_
 
   # ✅ DLP task 선택 (inverse부터)
-  - task: inverse_chain_2_gray
-
+  - task: inverse_physics_binary    
+  # inverse_1_gray, inverse_physics_binary, inverse_chain_2_gray
   # ✅ DLP 모델/데이터/로스는 새 그룹으로 분리
   # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)
   - model: unet_small
   - data: localLaptop_trainpack       # local_trainpack or localLaptop_trainpack
-  - LossFunction: BCEWithLogitsL1Loss
+  - LossFunction: physics_informedL1  #BCEWithLogitsL1Loss or physics_informedL1 or SigmoidL1Loss
 
   # 아래는 기존 hydra 뼈대 재사용용 (필요 없으면 점진적으로 제거)
   - optimizer: adamw
@@ -34,7 +34,7 @@ report_interval: 50000
 seed: 430
 num_workers: 8
 
-exp_name: dlp_inverse_forwardLoss
+exp_name: dlp_forward_benchmarkTest
 
 # ✅ [New] Evaluation / Benchmark Config
 evaluation:
@@ -61,12 +61,19 @@ evaluation:
 
     # ✅ [NEW] Evaluation DoC stage toggle (LD->CI vs LD->DoC->CI)
     doc:
-      enable: true
+      enable: false
       gauss:
         enable: true
-        kernel_size: 11
-        sigma: 10
+        kernel_size: 41
+        sigma: 1
         n_iter: 1
+
+    # ✅ [NEW] Band-only optimization at evaluation time (forward input constraint)
+    bandopt:
+      enable: true
+      band_width: 21          # morphological band width (odd recommended)
+      apply_to: "corr"        # "corr" | "both" (default corr)
+      fixed_logit_val: 20.0   # used only if inverse_post.apply_sigmoid=false (logits blending)
 
 # ✅ DLP image I/O 공통 옵션 (Dataset/Transform에서 사용)
 image:

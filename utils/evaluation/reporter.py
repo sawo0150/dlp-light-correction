@@ -46,6 +46,13 @@ class BenchmarkReporter:
         doc_gauss_kernel_size: int = 51,
         doc_gauss_sigma: float = 12.0,
         doc_gauss_n_iter: int = 1,
+
+        # ✅ [NEW] Band-only optimization (eval-only)
+        bandopt_enable: bool = False,
+        bandopt_band_width: int = 11,
+        bandopt_apply_to: str = "corr",      # "corr" | "both"
+        bandopt_fixed_logit_val: float = 20.0,
+
     ):
         self.inverse_model = inverse_model
         self.forward_model = forward_model
@@ -75,6 +82,12 @@ class BenchmarkReporter:
         self.doc_gauss_kernel_size = int(doc_gauss_kernel_size)
         self.doc_gauss_sigma = float(doc_gauss_sigma)
         self.doc_gauss_n_iter = int(doc_gauss_n_iter)
+
+        # ✅ bandopt configs
+        self.bandopt_enable = bool(bandopt_enable)
+        self.bandopt_band_width = int(bandopt_band_width)
+        self.bandopt_apply_to = str(bandopt_apply_to).lower()
+        self.bandopt_fixed_logit_val = float(bandopt_fixed_logit_val)
 
     @staticmethod
     def _logit_safe(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -126,6 +139,48 @@ class BenchmarkReporter:
     def _bin01(x: torch.Tensor, thr: float = 0.5) -> torch.Tensor:
         """x: [B,1,H,W] float -> {0,1} float"""
         return (x >= thr).float()
+
+    def _get_band_mask(self, mask01: torch.Tensor) -> torch.Tensor:
+        """
+        mask01: [B,1,H,W] in {0,1} (recommended)
+        band = dilate(mask) - erode(mask)
+        """
+        bw = int(self.bandopt_band_width)
+        if bw <= 1:
+            return torch.zeros_like(mask01)
+        if bw % 2 == 0:
+            bw += 1
+        pad = bw // 2
+        dilated = F.max_pool2d(mask01, kernel_size=bw, stride=1, padding=pad)
+        eroded  = -F.max_pool2d(-mask01, kernel_size=bw, stride=1, padding=pad)
+        band = (dilated - eroded)
+        return (band > 0).float()
+
+    def _apply_bandopt(self, x: torch.Tensor, target_ref: torch.Tensor) -> torch.Tensor:
+        """
+        Enforce: outside band -> equals target_ref.
+
+        x:         corrected mask input to forward (either prob[0,1] or logits)
+        target_ref: the reference target mask that forward would see (after pixelize + input_policy)
+                   shape [B,1,H,W]
+        """
+        if not self.bandopt_enable:
+            return x
+
+        # band computed from target reference edges (robustly binarized)
+        tbin = self._bin01(target_ref, 0.5)
+        band = self._get_band_mask(tbin)  # 1 in band, 0 outside
+
+        # Case A) inverse output is prob domain (common in your current config)
+        if self.inv_apply_sigmoid:
+            # outside band: exactly target_ref (not tbin) to respect input_policy choice
+            return x * band + target_ref * (1.0 - band)
+
+        # Case B) inverse output is logits (inv_apply_sigmoid=False)
+        # -> outside band, pin logits to +/- fixed_val based on target binary
+        v = float(self.bandopt_fixed_logit_val)
+        fixed_logits = tbin * v + (1.0 - tbin) * (-v)
+        return x * band + fixed_logits * (1.0 - band)
 
     def _count_error_pixels(self, pred01: torch.Tensor, target01: torch.Tensor) -> Tuple[int, int]:
         """
@@ -190,6 +245,15 @@ class BenchmarkReporter:
         arr = tensor.squeeze().detach().cpu().numpy()
         arr = np.clip(arr, 0, 1) * 255.0
         return arr.astype(np.uint8)
+
+    def _to_mask01_for_viz(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B,1,H,W] could be prob(0~1) or logits.
+        Make a safe 0~1 tensor for visualization.
+        """
+        if not self.inv_apply_sigmoid:
+            x = torch.sigmoid(x)
+        return torch.clamp(x, 0.0, 1.0)
 
     def _resize_tensor(self, tensor: torch.Tensor, size: int) -> torch.Tensor:
         """ Resize [B, 1, H, W] tensor (default bilinear for continuous maps) """
@@ -300,6 +364,15 @@ class BenchmarkReporter:
                 if self.mp_enable and self.mp_apply_to in ("both", "corr"):
                     Corr_in = self._pixelize_mask(Corr_in)
                 Corr_in = self._apply_forward_input_policy(Corr_in)
+
+                # ✅ [NEW] BandOpt (eval-only): forward input differs from target only in band region
+                # Reference is Naive_in (already pixelize + input_policy applied)
+                if self.bandopt_enable and self.bandopt_apply_to in ("corr", "both"):
+                    Corr_in = self._apply_bandopt(Corr_in, target_ref=Naive_in)
+ 
+                # ✅ NEW: "Corr Mask" visualization uses the actual forward input (bandopt-applied)
+                Corr_mask_for_viz = self._to_mask01_for_viz(Corr_in)
+
                 Corrected_Print_infer = self.forward_model(Corr_in)
                 Corrected_Print_infer = self._apply_curing(Corrected_Print_infer)
  
@@ -332,7 +405,7 @@ class BenchmarkReporter:
             img_Naive_Err_rgb = self._get_error_heatmap(img_Naive_P, img_T)
 
             # Row 4: Corrected Mask (M) (gray or binary depending on config)
-            img_M = self._to_numpy_u8(self._resize_mask_tensor(M_out, self.viz_size))
+            img_M = self._to_numpy_u8(self._resize_mask_tensor(Corr_mask_for_viz, self.viz_size))
             img_M_rgb = cv2.cvtColor(img_M, cv2.COLOR_GRAY2RGB)
 
             # Row 5: Corrected Print (P(M))

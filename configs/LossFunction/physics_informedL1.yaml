@@ -2,7 +2,7 @@
 
 _target_: utils.common.physics_loss.PhysicsInformedLoss
 
-forward_checkpoint: ${evaluation.benchmark.proxy_checkpoint}
+forward_checkpoint: "../result/forward_2/checkpoints/best_model.pt"
 forward_output_is_logits: true
 
 grid_size: 160
@@ -12,11 +12,17 @@ infer_size: 640
 cure_thr_low: 50.0
 cure_thr_high: 80.0
 
+# ✅ NEW: curing mode selection
+curing:
+  mode: "soft_piecewise"   # ["soft_piecewise", "hard_threshold", "sigmoid_threshold"]
+  threshold: 0.23529       # hard/sigmoid 모드에서 사용 (0~1 in normalized LD)
+  sigmoid_temp: 20.0       # sigmoid_threshold 모드에서 sharpness (클수록 hard에 가까움)
+
 device: cuda
 
 # ✅ DoC (LD->(DoC)->CI에서 DoC만 on/off)
-doc_enable: true
+doc_enable: false
 doc_gauss_enable: true
-doc_gauss_kernel_size: 11
-doc_gauss_sigma: 10
+doc_gauss_kernel_size: 41
+doc_gauss_sigma: 1
 doc_gauss_n_iter: 1

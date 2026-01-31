@@ -129,6 +129,13 @@ def create_data_loaders(args, split: str, shuffle: bool, is_train: bool) -> Data
     # task별 데이터 정책 읽기
     task_name = _get_task_name(task_cfg)
 
+    # ✅ compute pipe_enable ONCE (inverse only)
+    pipe_enable = False
+    if task_name.startswith("inverse"):
+        inv_cfg_for_pipe = (task_cfg.get("inverse") or {})
+        pipe_cfg_for_pipe = (inv_cfg_for_pipe.get("pipeline") or {})
+        pipe_enable = bool(pipe_cfg_for_pipe.get("enable", False))
+
     # split/mode/allow는 task 하위 data를 최우선
     # (inverse/forward 공통적으로 "data" 키를 갖도록 설계)
     if task_name.startswith("inverse"):
@@ -165,10 +172,6 @@ def create_data_loaders(args, split: str, shuffle: bool, is_train: bool) -> Data
             # ✅ target mask만 있으면 되므로 require_flags 강제 없음
             pass
 
-        # ✅ NEW: pipeline(chain) mode면 LD GT가 필요하므로 has_fwd도 강제
-        inv_cfg = (task_cfg.get("inverse") or {})
-        pipe_cfg = (inv_cfg.get("pipeline") or {})
-        pipe_enable = bool(pipe_cfg.get("enable", False))
         if pipe_enable:
             require_flags["has_fwd"] = 1
 
@@ -255,15 +258,27 @@ def create_data_loaders(args, split: str, shuffle: bool, is_train: bool) -> Data
     image_cfg = _common_image_cfg(args)
 
     if task_name.startswith("inverse"):
-        ds = InverseThr2MaskDataset(
-            root=root,
-            rows=rows,
-            task_cfg=task_cfg,
-            image_cfg=image_cfg,
-            thr_index_path=thr_index_path,
-            is_train=is_train,
-            seed=int(getattr(args, "seed", 1234)),
-        )
+
+        if pipe_enable:
+            ds = InverseThr2LDMaskDataset(
+                root=root,
+                rows=rows,
+                task_cfg=task_cfg,
+                image_cfg=image_cfg,
+                thr_index_path=thr_index_path,
+                is_train=is_train,
+                seed=int(getattr(args, "seed", 1234)),
+            )
+        else:
+            ds = InverseThr2MaskDataset(
+                root=root,
+                rows=rows,
+                task_cfg=task_cfg,
+                image_cfg=image_cfg,
+                thr_index_path=thr_index_path,
+                is_train=is_train,
+                seed=int(getattr(args, "seed", 1234)),
+            )
     elif task_name.startswith("forward"):
         ds = ForwardMask2LDDataset(
             root=root,

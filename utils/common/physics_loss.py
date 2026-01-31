@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Any, Dict, Optional
 
 from utils.evaluation.proxy_forward import ProxyForwardModel
 
@@ -32,6 +33,8 @@ class PhysicsInformedLoss(nn.Module):
         infer_size: int = 640,
         cure_thr_low: float = 50.0,
         cure_thr_high: float = 80.0,
+        # ✅ NEW: curing config (selectable)
+        curing: Optional[Dict[str, Any]] = None,
         # ✅ [NEW] DoC options (Hydra로 조절)
         doc_enable: bool = False,
         doc_gauss_enable: bool = True,
@@ -48,6 +51,17 @@ class PhysicsInformedLoss(nn.Module):
         self.cure_thr_low = cure_thr_low
         self.cure_thr_high = cure_thr_high
         
+        # ✅ curing config
+        curing = dict(curing or {})
+        self.curing_mode = str(curing.get("mode", "soft_piecewise")).strip().lower()
+        # threshold is in normalized LD domain: sigmoid(ld_logits) in [0,1]
+        self.curing_threshold = float(curing.get("threshold", 0.23529))
+        self.curing_sigmoid_temp = float(curing.get("sigmoid_temp", 20.0))
+
+        valid_modes = {"soft_piecewise", "hard_threshold", "sigmoid_threshold"}
+        if self.curing_mode not in valid_modes:
+            raise ValueError(f"Unknown curing.mode='{self.curing_mode}'. Valid: {sorted(valid_modes)}")
+
         # ✅ DoC config
         self.doc_enable = bool(doc_enable)
         self.doc_gauss_enable = bool(doc_gauss_enable)
@@ -64,6 +78,31 @@ class PhysicsInformedLoss(nn.Module):
         # Explicitly freeze parameters just in case
         for param in self.forward_model.parameters():
             param.requires_grad = False
+
+    def _apply_curing(self, ld_logits: torch.Tensor) -> torch.Tensor:
+        """
+        ld_logits: (B,1,H,W) logits (LD)
+        Returns cured image in [0,1].
+
+        Modes:
+          - soft_piecewise: 기존 _soft_curing() (미분 가능)
+          - hard_threshold: (sigmoid(ld_logits) >= thr).float() (거의 미분 불가)
+          - sigmoid_threshold: sigmoid(temp*(sigmoid(ld)-thr)) (미분 가능, hard 근사)
+        """
+        if self.curing_mode == "soft_piecewise":
+            return self._soft_curing(ld_logits)
+
+        ld_01 = torch.sigmoid(ld_logits)  # normalized intensity in [0,1]
+        thr = float(self.curing_threshold)
+
+        if self.curing_mode == "hard_threshold":
+            # ⚠️ hard step -> gradient 거의 0 (학습이 멈출 수 있음)
+            return (ld_01 >= thr).to(ld_01.dtype)
+
+        # sigmoid_threshold
+        temp = float(self.curing_sigmoid_temp)
+        # larger temp -> sharper transition
+        return torch.sigmoid(temp * (ld_01 - thr))
 
     # -----------------------------
     # ✅ [NEW] DoC utils
@@ -210,8 +249,8 @@ class PhysicsInformedLoss(nn.Module):
         if self.doc_enable:
             ld_logits = self._degree_of_cure(ld_logits)
 
-        # 5. Differentiable Soft Curing (keep as-is)
-        cured_img = self._soft_curing(ld_logits)
+        # 5. ✅ Selectable curing (yaml controlled)
+        cured_img = self._apply_curing(ld_logits)
           
         # safety: ensure target is same spatial size as cured_img
         if target_mask.shape[-2:] != cured_img.shape[-2:]:

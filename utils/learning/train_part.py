@@ -22,7 +22,9 @@ import os
 #    torch import *이전*에 export 해야 효과가 납니다.  :contentReference[oaicite:0]{index=0}
 #---------------------------------------------------------#
 os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF",
+    # "PYTORCH_CUDA_ALLOC_CONF" is deprecated in newer PyTorch.
+    # Keep backward-compat but prefer PYTORCH_ALLOC_CONF.
+    "PYTORCH_ALLOC_CONF",
     "max_split_size_mb:64,garbage_collection_threshold:0.6"
 )
 
@@ -38,7 +40,7 @@ import torch.nn.functional as F
 from utils.data.dataloader_factory import create_data_loaders
 from utils.logging.wandb_logger import WandbLogger
 from utils.common.utils import compute_segmentation_metrics, compute_regression_metrics
-from utils.common.utils import _get_pipe_cfg, _apply_stage_input_policy, _gaussian_kernel2d, _blur_01, _make_doc_pseudo
+from utils.common.utils import _get_pipe_cfg, _apply_stage_input_policy, _gaussian_kernel2d, _blur_01, _make_doc_pseudo, _StageSequentialWrapper
 from utils.evaluation.benchmark_dataset import BenchmarkDataset
 from utils.evaluation.proxy_forward import ProxyForwardModel
 from utils.evaluation.reporter import BenchmarkReporter
@@ -601,13 +603,17 @@ def train(args):
             losses[s] = instantiate(OmegaConf.create(losses_cfg[s])).to(device=device)
 
     # ✅ avoid gigantic repr (ProxyForwardModel / Unet dump)
-    msg = f"[Hydra] loss_func ▶ {loss_fn.__class__.__name__}"
-    # best-effort: print key hyperparams if present
-    for k in ("grid_size", "infer_size", "cure_thr_low", "cure_thr_high"):
-        if hasattr(loss_fn, k):
-            msg += f" | {k}={getattr(loss_fn, k)}"
-    print(msg)
-
+    if not pipe_enable:
+        msg = f"[Hydra] loss_func ▶ {loss_fn.__class__.__name__}"
+        for k in ("grid_size", "infer_size", "cure_thr_low", "cure_thr_high"):
+            if hasattr(loss_fn, k):
+                msg += f" | {k}={getattr(loss_fn, k)}"
+        print(msg)
+    else:
+        # pipeline: stage losses 출력
+        stage_names = list(pipe_cfg.get("stages", []) or [])
+        loss_names = {s: losses[s].__class__.__name__ for s in stage_names if s in losses}
+        print(f"[Hydra] pipeline losses ▶ {loss_names}")
     # ──────────────────────────────────────────────────────────────────────────
     # ✅ [FIX] Optimizer 초기화 (UnboundLocalError 해결)
     # 스케줄러 생성 전에 반드시 Optimizer가 있어야 합니다.
@@ -681,8 +687,18 @@ def train(args):
     print(f"[Resume] {getattr(args, 'resume_checkpoint', None)}")
     if getattr(args, 'resume_checkpoint', None):
         ckpt = torch.load(args.resume_checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
+        if not pipe_enable:
+            model.load_state_dict(ckpt['model'])
+            optimizer.load_state_dict(ckpt['optimizer'])
+        else:
+            # pipeline resume
+            msd = ckpt.get("models", None)
+            osd = ckpt.get("opts", None)
+            if msd is None or osd is None:
+                raise KeyError("Resume checkpoint missing 'models'/'opts' for pipeline run.")
+            for s in stages:
+                models[s].load_state_dict(msd[s])
+                opts[s].load_state_dict(osd[s])
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         best_val_ssim = ckpt.get('best_val_ssim', 0.0)
         start_epoch = ckpt.get('epoch', 0)
@@ -744,6 +760,7 @@ def train(args):
         mp_cfg: Dict[str, Any] = bench_cfg.get("mask_pixelize", {}) or {}
         fwd_post: Dict[str, Any] = bench_cfg.get("forward_post", {}) or {}
         doc_cfg: Dict[str, Any] = bench_cfg.get("doc", {}) or {}
+        bandopt_cfg: Dict[str, Any] = bench_cfg.get("bandopt", {}) or {}
         fwd_apply_sigmoid = bool(fwd_post.get("apply_sigmoid", False))
 
         inv_apply_sigmoid = bool(inv_post.get("apply_sigmoid", True))
@@ -767,6 +784,12 @@ def train(args):
         doc_gauss_sigma = float(doc_gauss.get("sigma", 12.0))
         doc_gauss_n_iter = int(doc_gauss.get("n_iter", 1))
  
+        # ✅ BandOpt (eval)
+        bandopt_enable = bool(bandopt_cfg.get("enable", False))
+        bandopt_band_width = int(bandopt_cfg.get("band_width", 11))
+        bandopt_apply_to = str(bandopt_cfg.get("apply_to", "corr")).lower()
+        bandopt_fixed_logit_val = float(bandopt_cfg.get("fixed_logit_val", 20.0))
+
         print(
             f"[Benchmark] inverse_post: apply_sigmoid={inv_apply_sigmoid}, "
             f"binarize={inv_binarize}, thr={inv_bin_thr} | "
@@ -775,6 +798,10 @@ def train(args):
         print(
             f"[Benchmark] doc: enable={doc_enable} | "
             f"gauss(enable={doc_gauss_enable}, ks={doc_gauss_kernel_size}, sigma={doc_gauss_sigma}, n_iter={doc_gauss_n_iter})"
+        )
+        print(
+            f"[Benchmark] bandopt: enable={bandopt_enable} | "
+            f"band_width={bandopt_band_width}, apply_to={bandopt_apply_to}, fixed_logit_val={bandopt_fixed_logit_val}"
         )
 
         # 2. Model Input Size Resolution (✅ forward 학습 out_size를 우선 사용)
@@ -785,8 +812,14 @@ def train(args):
         fwd_binarize_input = bool((fwd_cfg or {}).get("binarize_input", False))
 
         # 3. Reporter Init
+        # ✅ pipeline이면 "전체 stage를 이어서" mask_logits를 내는 wrapper를 inverse_model로 전달
+        if not pipe_enable:
+            inv_model_for_report = model
+        else:
+            inv_model_for_report = _StageSequentialWrapper(models=models, stages=stages).to(device)
+
         benchmark_reporter = BenchmarkReporter(
-            inverse_model=model,
+            inverse_model=inv_model_for_report,
             forward_model=proxy_model,
             device=device,
             image_size=640,          # Visualization Size (Canvas)
@@ -809,7 +842,12 @@ def train(args):
             doc_gauss_kernel_size=doc_gauss_kernel_size,
             doc_gauss_sigma=doc_gauss_sigma,
             doc_gauss_n_iter=doc_gauss_n_iter,
-        )
+            # ✅ NEW: BandOpt options
+            bandopt_enable=bandopt_enable,
+            bandopt_band_width=bandopt_band_width,
+            bandopt_apply_to=bandopt_apply_to,
+            bandopt_fixed_logit_val=bandopt_fixed_logit_val,
+         )
         bench_freq = int(bench_cfg.get("log_every_n_epochs", 1))
 
 
@@ -905,18 +943,33 @@ def train(args):
             is_new_best = False
 
         # ✨ save_model에 val_loss_history 추가 (상태 저장을 위해)
-        checkpoint = {
-            'epoch': epoch + 1,
-            'args': args,
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            'scaler': scaler.state_dict(),          
-            'best_val_score': best_val_score,
-            'best_val_loss': best_val_loss,
-            'exp_dir': str(args.exp_dir),
-            'val_loss_history': val_loss_history 
-        }
+        if not pipe_enable:
+            checkpoint = {
+                'epoch': epoch + 1,
+                'args': args,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                'scaler': scaler.state_dict(),
+                'best_val_score': best_val_score,
+                'best_val_loss': best_val_loss,
+                'exp_dir': str(args.exp_dir),
+                'val_loss_history': val_loss_history,
+            }
+        else:
+            checkpoint = {
+                'epoch': epoch + 1,
+                'args': args,
+                'models': {s: models[s].state_dict() for s in stages},
+                'opts': {s: opts[s].state_dict() for s in stages},
+                # stage별 scheduler를 아직 안 쓰니까 None으로 유지
+                "scheduler": None,
+                'scaler': scaler.state_dict(),
+                'best_val_score': best_val_score,
+                'best_val_loss': best_val_loss,
+                'exp_dir': str(args.exp_dir),
+                'val_loss_history': val_loss_history,
+            }
         torch.save(checkpoint, args.exp_dir / 'model.pt')
 
         if is_new_best:
@@ -932,7 +985,12 @@ def train(args):
 
         # ✅ Val/Test metric: epoch 단위 로깅
         if logger.enabled:
-            lr = optimizer.param_groups[0]["lr"] if optimizer else 0.0
+            if not pipe_enable:
+                lr = optimizer.param_groups[0]["lr"] if optimizer else 0.0
+            else:
+                # 대표 lr: 마지막 stage(보통 mask stage)
+                last_stage = stages[-1]
+                lr = opts[last_stage].param_groups[0]["lr"]
             # backward compat: val_dice/val_iou 슬롯을 task별로 재사용
             if task_name.startswith("inverse"):
                 v1, v2 = float(val_m1), float(val_m2)  # dice/iou
@@ -955,10 +1013,16 @@ def train(args):
         if logger.enabled:
             wb_cfg = getattr(args, "wandb", {}) if hasattr(args, "wandb") else {}
             split_name = str(wb_cfg.get("log_images_split", "val")).lower() if isinstance(wb_cfg, dict) else "val"
-            if split_name == "train":
-                logger.log_epoch_images(model=model, loader=train_loader, epoch=epoch, split_name="train", device=device, step=global_iter)
+           # ✅ pipeline일 때도 "전체 stage 이어붙인 출력"을 시각화하고 싶으면 wrapper로 로깅
+            if not pipe_enable:
+                log_model = model
             else:
-                logger.log_epoch_images(model=model, loader=val_loader, epoch=epoch, split_name="val", device=device, step=global_iter)
+                log_model = _StageSequentialWrapper(models=models, stages=stages).to(device)
+                log_model.eval()
+            if split_name == "train":
+                logger.log_epoch_images(model=log_model, loader=train_loader, epoch=epoch, split_name="train", device=device, step=global_iter)
+            else:
+                logger.log_epoch_images(model=log_model, loader=val_loader, epoch=epoch, split_name="val", device=device, step=global_iter)
 
         # ──────────────────────────────────────────────────────────────────────
         # ✅ [Benchmark Report] 벤치마크 리포트 생성 및 W&B 전송
@@ -970,6 +1034,7 @@ def train(args):
             
             # W&B Logging
             if logger.enabled and wandb.run is not None:
+                # report_imgs includes both images and scalar metrics; wandb.log handles mixed dict.
                 wandb.log(report_imgs, step=global_iter)
 
         # best 모델 저장은 기존 로직 유지 (wandb artifact는 main/train에서 선택적으로 추가 가능)

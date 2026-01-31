@@ -25,7 +25,7 @@ inverse:
     max_samples_unit: "items"
     resample_each_epoch: false
     with_replacement: false
-    debug: { enable: true, examples: 5 }
+    debug: { enable: false, examples: 5 }
 
   # ✅ chain pipeline config
   pipeline:
