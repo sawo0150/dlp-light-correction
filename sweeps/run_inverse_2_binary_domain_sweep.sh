@@ -1,50 +1,47 @@
 #!/bin/bash
-# sweeps/run_inverse_1_forwardLoss_sweep.sh
+# trainingScripts/run_inverse_2_binary_domain_sweep.sh
 # ================================================================
-# Sweep DLP Inverse Physics-Informed over multiple (B1~B5) domains.
-# Task: Target Mask -> Corrected Mask -> Forward -> Loss
-# 
+# Sweep DLP inverse_chain_2_binary over multiple (B1~B5) domain mixtures.
+#
 # - max_samples.train = 10000 (items 기준)
 # - domain.enable = true
-# - Physics Loss / Band UNet 사용
+# - 각 조합을 순차 실행
 # ================================================================
 
 set -euo pipefail
+
 export CUDA_VISIBLE_DEVICES=0
 
-
 PROJECT="dlp_inverse_DataComparasion"
-BASE_EXP_PREFIX="dlp_inv_phys_dom"
+BASE_EXP_PREFIX="dlp_inverse_binary_2_dom"
 EPOCHS=4
 ACCUM=4
 BS=2
 MAX_SAMPLES_TRAIN=10000
 
-# 공통 hydra overrides (Physics 설정 유지)
+# 공통 hydra overrides
 COMMON_ARGS=(
-  "data=local_trainpack_binary"
-  "task=inverse_physics_binary"
-  "model=unet_small"
-  "LossFunction=physics_informedL1"
-  "LossFunction.doc_enable=false"
+  "task=inverse_chain_2_binary"
+  "LossFunction=BCEWithLogitsL1Loss"
   "wandb.project=${PROJECT}"
-  
-  # Physics specific
+
+  # ✅ binary target
   "image.binarize_target=true"
-  "training_amp=true"
 
   "num_epochs=${EPOCHS}"
   "training_accum_steps=${ACCUM}"
   "batch_size=${BS}"
   "hydra.job.chdir=false"
 
-  # benchmark
+  # ✅ benchmark viz/eval: corrected mask를 binary로 만들어 proxy forward에 넣기
   "evaluation.benchmark.enable=true"
   "evaluation.benchmark.doc.enable=false"
-  "evaluation.benchmark.bandopt.enable=true"
-  "evaluation.benchmark.inverse_post.binarize=false"
+  "evaluation.benchmark.bandopt.enable=false"
+  "evaluation.benchmark.inverse_post.apply_sigmoid=true"
+  "evaluation.benchmark.inverse_post.binarize=true"
+  "evaluation.benchmark.inverse_post.binarize_thr=0.5"
 
-  # data cap
+  # data cap (items 기준 10000)
   "task.inverse.data.max_samples.train=${MAX_SAMPLES_TRAIN}"
   "task.inverse.data.max_samples_unit=items"
 

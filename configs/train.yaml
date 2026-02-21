@@ -9,7 +9,7 @@ defaults:
   # ✅ DLP 모델/데이터/로스는 새 그룹으로 분리
   # (모델 구현은 이후에 갈아끼우기 쉬움: UNet / Pix2Pix 등)
   - model: unet_small
-  - data: localLaptop_trainpack       # local_trainpack or localLaptop_trainpack
+  - data: local_trainpack       # local_trainpack or localLaptop_trainpack
   - LossFunction: physics_informedL1  #BCEWithLogitsL1Loss or physics_informedL1 or SigmoidL1Loss
 
   # 아래는 기존 hydra 뼈대 재사용용 (필요 없으면 점진적으로 제거)

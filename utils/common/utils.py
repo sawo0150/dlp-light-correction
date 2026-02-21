@@ -123,6 +123,11 @@ class _StageSequentialWrapper(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x
-        for s in self.stages:
+        for i, s in enumerate(self.stages):
             h = self.models[s](h)
+
+            # ✅ stage between sigmoid: thr2ld(또는 ld2doc)의 logits -> 0~1로 변환
+            if i < len(self.stages) - 1:
+                if s in ("thr2ld", "ld2doc"):   # 필요시 stage명 확장
+                    h = torch.sigmoid(h)
         return h

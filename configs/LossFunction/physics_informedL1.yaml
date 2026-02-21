@@ -9,14 +9,14 @@ grid_size: 160
 infer_size: 640
 
 # intensity in [0,255]
-cure_thr_low: 50.0
+cure_thr_low: 40.0
 cure_thr_high: 80.0
 
 # ✅ NEW: curing mode selection
 curing:
-  mode: "soft_piecewise"   # ["soft_piecewise", "hard_threshold", "sigmoid_threshold"]
+  mode: "sigmoid_threshold"   # ["soft_piecewise", "hard_threshold", "sigmoid_threshold"]
   threshold: 0.23529       # hard/sigmoid 모드에서 사용 (0~1 in normalized LD)
-  sigmoid_temp: 20.0       # sigmoid_threshold 모드에서 sharpness (클수록 hard에 가까움)
+  sigmoid_temp: 100.0       # sigmoid_threshold 모드에서 sharpness (클수록 hard에 가까움)
 
 device: cuda
 

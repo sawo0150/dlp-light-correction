@@ -1,0 +1,65 @@
+# configs/task/inverse_chain_2_binary.yaml
+name: inverse_chain_2_binary
+
+inverse:
+  input_source: "thr_random"          # ["thr_random", "thr_fixed", "ld_1280_aligned"]
+  thr_random_policy: "expand_all"
+  thr_fixed_values: []
+  thr_stack: false
+
+  # ✅ targets (chain dataset이 이 키를 사용)
+  target_mask_key: "mask_160"
+  target_ld_key: "ld_1280_aligned"
+
+  preprocess:
+    out_size: 640
+
+  # ✅ binary only
+  data:
+    modes: ["binary"]
+    split_source: "manifest"
+    dataset_allow: []
+    domain:
+      enable: false
+      weights: { B1: 1.0, B2: 1.0, B3: 1.0, B4: 1.0, B5: 1.0 }
+    max_samples: { train: 0, val: 0, test: 0 }
+    max_samples_unit: "items"
+    resample_each_epoch: false
+    with_replacement: false
+    debug: { enable: false, examples: 5 }
+
+  pipeline:
+    enable: true
+    stages: ["thr2ld", "ld2mask"]
+
+    # 학습 안정성: baseline 재현은 gt 권장
+    input_policy:
+      ld2mask: "gt"          # ["gt", "pred_detach"]
+
+    # 원하면 후반에 gt -> pred_detach로 전환(체인 정합성)
+    schedule:
+      enable: false
+      switch_epoch: 2
+      ld2mask_after: "pred_detach"
+
+    models:
+      thr2ld: ${model}
+      ld2mask: ${model}
+
+    optimizers:
+      thr2ld: ${optimizer}
+      ld2mask: ${optimizer}
+
+    losses:
+      # thr2ld: thr(0~1) -> ld(0~1) 회귀
+      thr2ld:
+        _target_: utils.common.loss_function.SigmoidL1Loss
+
+      # ld2mask: binary segmentation (logits 기반 로스 추천)
+      # train.yaml에서 LossFunction=... 로 오버라이드해서 사용
+      ld2mask: ${LossFunction}
+
+    grad_clip:
+      enable: false
+      max_norm: 1.0
+      norm_type: 2

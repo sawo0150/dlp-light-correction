@@ -90,16 +90,17 @@ python main.py \
     hydra.job.chdir=false
 
 python main.py \
+    data=local_trainpack_binary \
     task=inverse_physics_binary \
     model=unet_small \
     LossFunction=physics_informedL1 \
     LossFunction.doc_enable=false \
-    exp_name=inverse_forwardLoss \
+    exp_name=inverse_forwardLoss_sigmoid100 \
     wandb.project=dlp_models_comparasion \
     \
     image.binarize_target=true \
     \
-    num_epochs=10 \
+    num_epochs=4 \
     training_amp=true \
     training_accum_steps=4 \
     batch_size=2 \
@@ -110,3 +111,24 @@ python main.py \
     evaluation.benchmark.bandopt.enable=true \
     evaluation.benchmark.inverse_post.binarize=false \
     hydra.job.chdir=false
+
+
+python main.py \
+  task=inverse_chain_2_binary \
+  LossFunction=BCEWithLogitsL1Loss \
+  exp_name=inverse_binary_chain_2_BCEWithLogitsL1 \
+  wandb.project=dlp_models_comparasion \
+  \
+  image.binarize_target=true \
+  \
+  num_epochs=4 \
+  training_accum_steps=4 \
+  batch_size=2 \
+  \
+  evaluation.benchmark.enable=true \
+  evaluation.benchmark.doc.enable=false \
+  evaluation.benchmark.bandopt.enable=false \
+  evaluation.benchmark.inverse_post.apply_sigmoid=true \
+  evaluation.benchmark.inverse_post.binarize=true \
+  evaluation.benchmark.inverse_post.binarize_thr=0.5 \
+  hydra.job.chdir=false
